@@ -459,7 +459,11 @@ impl Drop for FinishGuard<'_> {
 
 /// Download the NAR (failing over across upstreams), then import it. The
 /// narinfo is (re-)fetched inside the task: NAR requests carry only the
-/// store hash, so the mapping is resolved here, keyed by it.
+/// store hash, and nothing is stored between the narinfo and NAR requests
+/// by design, so the mapping is resolved here, keyed by it. That doubles
+/// upstream narinfo GETs per pull (serve + task); against CDN-fronted
+/// upstreams the edge absorbs it, against bare S3/R2 object storage each
+/// GET is a billed request — put a cache in front if that matters.
 async fn run_download(settings: web::Data<Config>, hash: String, dl: Arc<ActiveDownload>) {
     let _cleanup = FinishGuard {
         downloads: &settings.pull_through.downloads,

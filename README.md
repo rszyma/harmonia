@@ -194,6 +194,18 @@ on `PATH`, and the service user needs permission to import into the store.
 On NixOS, use `services.harmonia-dev.cache.pullThrough` (see below), which
 relaxes the service sandbox accordingly.
 
+Operational note: every pull fetches the narinfo twice — once to serve
+(and rewrite) it, once inside the pull task — and concurrent narinfo
+requests are not de-duplicated. That is deliberate: nothing is stored
+between the narinfo and NAR requests, so each request re-resolves
+everything from the hash alone and the server holds no per-client state
+to expire, persist, or coordinate (only in-flight NAR pulls are tracked,
+and those clean themselves up on completion). The price is duplicate
+tiny GETs instead of a pending-request index with lifetimes.
+Against CDN-fronted upstreams the edge absorbs them; if you serve
+narinfos straight from S3/R2 object storage, each GET is a billed
+request, so front it with a cache.
+
 By default a pull runs to completion in the background even if the client
 that triggered it disconnects, warming the cache for the next request. Set
 `upstream_cancel_on_disconnect = true` (global for all upstream caches) to
