@@ -182,21 +182,30 @@ async fn test_pull_through_imports_into_local_store() -> Result<()> {
 
 #[tokio::test]
 async fn test_pull_through_concurrent_requests_share_one_import() -> Result<()> {
-    let fixture = setup(b"concurrent payload").await?;
+    let mut fixture = setup(b"concurrent payload").await?;
     let narinfo_url = format!("{}/{}.narinfo", fixture.main_url, fixture.hash);
 
-    // Hammer the same missing path from several tasks; all must succeed.
+    // One narinfo fetch names the canonical NAR; hammer that from several
+    // tasks. All must stream the same bytes from a single pull+import.
+    let body = curl(&narinfo_url).await?;
+    let nar_path = nar_url_path_from(&body)?;
     let mut handles = Vec::new();
     for _ in 0..8 {
-        let url = narinfo_url.clone();
+        let url = format!("{}/{nar_path}", fixture.main_url);
         handles.push(tokio::spawn(async move {
-            curl(&url).await.map_err(|e| e.to_string())
+            curl_bytes(&url).await.map_err(|e| e.to_string())
         }));
     }
     for handle in handles {
-        let body = handle.await.map_err(|e| format!("task failed: {e}"))??;
-        assert!(body.contains("StorePath: "));
+        let bytes = handle.await.map_err(|e| format!("task failed: {e}"))??;
+        assert!(!bytes.is_empty());
     }
+    // All readers saw the same pull: killing the upstream still leaves
+    // the path served locally.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    fixture.upstream_guard.take();
+    let body = curl(&narinfo_url).await?;
+    assert!(body.contains("StorePath: "));
     Ok(())
 }
 
@@ -209,6 +218,7 @@ async fn run_slow_upstream(
     narinfo: Vec<u8>,
     nar: Vec<u8>,
     hits: Arc<AtomicUsize>,
+    nar_hits: Arc<AtomicUsize>,
 ) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     loop {
@@ -218,6 +228,7 @@ async fn run_slow_upstream(
         let narinfo = narinfo.clone();
         let nar = nar.clone();
         let hits = hits.clone();
+        let nar_hits = nar_hits.clone();
         tokio::spawn(async move {
             let mut head = Vec::new();
             let mut buf = [0u8; 1024];
@@ -251,6 +262,7 @@ async fn run_slow_upstream(
                 }
                 let _ = sock.write_all(&narinfo).await;
             } else {
+                nar_hits.fetch_add(1, Ordering::Relaxed);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/x-nix-nar\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     nar.len()
@@ -285,6 +297,7 @@ struct SlowFixture {
     main_url: String,
     nar_bytes: Vec<u8>,
     hits: Arc<AtomicUsize>,
+    nar_hits: Arc<AtomicUsize>,
     slow_task: tokio::task::JoinHandle<()>,
     _main_guard: Box<dyn Send>,
     _key_file: NamedTempFile,
@@ -351,11 +364,13 @@ async fn setup_slow(cancel_on_disconnect: bool, url_override: Option<&str>) -> R
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let slow_port = listener.local_addr()?.port();
     let hits = Arc::new(AtomicUsize::new(0));
+    let nar_hits = Arc::new(AtomicUsize::new(0));
     let slow_task = tokio::spawn(run_slow_upstream(
         listener,
         narinfo.into_bytes(),
         nar_bytes.clone(),
         hits.clone(),
+        nar_hits.clone(),
     ));
     let slow_url = format!("http://127.0.0.1:{slow_port}");
 
@@ -386,6 +401,7 @@ async fn setup_slow(cancel_on_disconnect: bool, url_override: Option<&str>) -> R
         main_url: format!("http://127.0.0.1:{main_port}"),
         nar_bytes,
         hits,
+        nar_hits,
         slow_task,
         _main_guard: main_guard,
         _key_file: key_file,
@@ -448,32 +464,33 @@ async fn test_pull_through_cancels_on_disconnect() -> Result<()> {
     let fix = setup_slow(true, None).await?;
     let narinfo_url = format!("{}/{}.narinfo", fix.main_url, fix.hash);
 
-    // The miss starts a pull that drips for ~20s.
+    // The narinfo alone spawns nothing: lazy pulls start at the NAR.
     let body = curl(&narinfo_url).await?;
     assert!(body.contains("StorePath: "));
     assert_eq!(fix.hits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        fix.nar_hits.load(Ordering::Relaxed),
+        0,
+        "narinfo must not start the pull"
+    );
     let nar_path = nar_url_path_from(&body)?;
 
-    // Attach a reader, then disconnect it mid-download.
+    // Attach a reader, then disconnect it mid-download (drips ~20s).
     let mut reader = curl_spawn(&format!("{}/{nar_path}", fix.main_url))?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     reader.kill().await?;
     reader.wait().await?;
 
-    // Outlive the 10s linger: the first pull must already be abandoned,
-    // so the next request re-fetches upstream.
+    // Outlive the 10s linger: the pull is abandoned, so the recovery
+    // NAR request starts a fresh pull (second upstream NAR fetch).
     tokio::time::sleep(Duration::from_secs(15)).await;
-    let body = curl(&narinfo_url).await?;
-    assert!(body.contains("StorePath: "));
+    let got = curl_bytes(&format!("{}/{nar_path}", fix.main_url)).await?;
+    assert_eq!(got, fix.nar_bytes);
     assert_eq!(
-        fix.hits.load(Ordering::Relaxed),
+        fix.nar_hits.load(Ordering::Relaxed),
         2,
         "abandoned pull should trigger a fresh upstream fetch"
     );
-
-    // Recovery: stream the NAR to completion and it imports.
-    let got = curl_bytes(&format!("{}/{}", fix.main_url, nar_url_path_from(&body)?)).await?;
-    assert_eq!(got, fix.nar_bytes);
     tokio::time::sleep(Duration::from_secs(3)).await;
     fix.slow_task.abort();
     let body = curl(&narinfo_url).await?;
@@ -497,7 +514,8 @@ async fn test_pull_through_completes_without_readers_by_default() -> Result<()> 
     reader.wait().await?;
 
     // Nobody ever reads again, but the default policy still finishes the
-    // pull in the background: re-attach after the drip ends and it imports.
+    // pull in the background: the NAR request below attaches to the
+    // completed download (or the finished import) either way.
     tokio::time::sleep(Duration::from_secs(20)).await;
     let got = curl_bytes(&format!("{}/{nar_path}", fix.main_url)).await?;
     assert_eq!(got, fix.nar_bytes);
@@ -512,57 +530,32 @@ async fn test_pull_through_completes_without_readers_by_default() -> Result<()> 
 }
 
 /// Upstream file names need not match harmonia's `/nar/<hash>.nar` routes
-/// (cache.nixos.org serves `nar/<file>.nar.zst`). The pull must still
-/// stream such files and import them; only the served URL differs.
+/// (cache.nixos.org serves `nar/<file>.nar.zst`). The served narinfo
+/// rewrites them to the canonical route, so the NAR request spawns the
+/// pull instead of 404ing — no matter what the upstream named it.
 #[tokio::test]
-async fn test_pull_through_serves_unroutable_upstream_filename() -> Result<()> {
+async fn test_pull_through_rewrites_upstream_filename() -> Result<()> {
     let fix = setup_slow(false, Some("nar/blob.bin")).await?;
     let narinfo_url = format!("{}/{}.narinfo", fix.main_url, fix.hash);
 
     let body = curl(&narinfo_url).await?;
+    let nar_path = nar_url_path_from(&body)?;
     assert!(
-        body.contains("URL: nar/blob.bin"),
-        "narinfo should name the upstream file verbatim, got: {body}"
+        !body.contains("URL: nar/blob.bin"),
+        "upstream filename must be rewritten, got: {body}"
+    );
+    assert!(
+        nar_path.starts_with("nar/")
+            && nar_path.contains(".nar?hash=")
+            && nar_path.ends_with(&fix.hash),
+        "narinfo should point at the canonical route, got: {nar_path}"
     );
 
-    // This exact request 404'd before the /nar/{tail} catch-all existed.
-    let got = curl_bytes(&format!("{}/nar/blob.bin", fix.main_url)).await?;
+    // The canonical NAR request spawns the pull and streams it.
+    let got = curl_bytes(&format!("{}/{nar_path}", fix.main_url)).await?;
     assert_eq!(got, fix.nar_bytes);
 
     // And the pull still imports normally.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    fix.slow_task.abort();
-    let body = curl(&narinfo_url).await?;
-    assert!(
-        body.contains("StorePath: "),
-        "path should be served locally after import, got: {body}"
-    );
-    Ok(())
-}
-
-/// Queued NARs start long after their narinfo was served: with the
-/// cancel policy on and no reader ever attached, the pull must still
-/// run to completion instead of aborting (cancellation requires a
-/// disconnect). hits stays 1: no refetch happens.
-#[tokio::test]
-async fn test_pull_through_never_attached_pull_completes() -> Result<()> {
-    let fix = setup_slow(true, None).await?;
-    let narinfo_url = format!("{}/{}.narinfo", fix.main_url, fix.hash);
-
-    let body = curl(&narinfo_url).await?;
-    let nar_path = nar_url_path_from(&body)?;
-    // Past the linger with no reader ever attached: the pull survives.
-    tokio::time::sleep(Duration::from_secs(15)).await;
-    let body = curl(&narinfo_url).await?;
-    assert!(body.contains("StorePath: "));
-    assert_eq!(
-        fix.hits.load(Ordering::Relaxed),
-        1,
-        "a pull nobody streamed must not be abandoned"
-    );
-    // The late NAR starts streaming the still-running pull to completion.
-    let got = curl_bytes(&format!("{}/{nar_path}", fix.main_url)).await?;
-    assert_eq!(got, fix.nar_bytes);
     tokio::time::sleep(Duration::from_secs(3)).await;
     fix.slow_task.abort();
     let body = curl(&narinfo_url).await?;

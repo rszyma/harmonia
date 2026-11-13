@@ -75,7 +75,7 @@ in
             type = lib.types.bool;
             default = false;
             example = true;
-            description = "Abandon an in-progress pull once every attached reader has disconnected, instead of finishing it in the background (global for all upstream caches). Cancellation requires a disconnect: a pull nobody ever streamed always runs to completion, since nix pipelines narinfo queries far ahead of NAR fetches. After the last reader detaches, a 10 second linger gives a flapping client room to rejoin. A later request simply starts a fresh download.";
+            description = "Abandon an in-progress pull once every attached reader has disconnected, instead of finishing it in the background (global for all upstream caches). Pulls are born from NAR requests that immediately stream them; after the last detach, a 10 second linger gives a flapping client room to rejoin. A later request simply starts a fresh download.";
           };
         };
 

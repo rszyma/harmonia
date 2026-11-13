@@ -168,14 +168,19 @@ All paths provided by `sign_key_paths` config option and `SIGN_KEY_PATHS` enviro
 
 ### Pull-through from upstream caches
 
-When `upstream_caches` is set, a request for a store path that is not in the
-local store starts a single download of the upstream NAR into a temp file.
+When `upstream_caches` is set, a narinfo request for a store path that is
+not in the local store is proxied from the first upstream that has it.
+The served narinfo points at this cache's own NAR route (rewritten from
+whatever filename the upstream used), so the client's follow-up NAR
+request starts a single download of the upstream NAR into a temp file.
 Concurrent requests for the same path stream the growing file immediately
 instead of waiting for the download; a slow client only slows its own
 stream. When the download completes, the path is imported into the local
 store with `nix copy`, so the cache host accumulates everything it serves
 and later requests are served from `/nix/store` normally. Requests that no
 upstream has stay 404, so clients fall back to their next substituter.
+Narinfo-only clients never trigger a download: pulls start exclusively
+on NAR requests.
 
 ```toml
 upstream_caches = [ "https://cache.nixos.org" ]
@@ -193,13 +198,11 @@ By default a pull runs to completion in the background even if the client
 that triggered it disconnects, warming the cache for the next request. Set
 `upstream_cancel_on_disconnect = true` (global for all upstream caches) to
 abandon a pull instead once every attached reader has disconnected — a
-later request simply starts a fresh download. Cancellation requires a
-disconnect: a pull nobody ever streamed always runs to completion, since
-nix pipelines narinfo queries far ahead of NAR fetches and a queued path's
-NAR routinely starts long after its narinfo was served. After the last
-reader detaches, a 10 second linger gives a flapping client room to rejoin
-(a fully stalled upstream still resolves through the download's idle
-timeout).
+later request simply starts a fresh download. Pulls are born from NAR
+requests that immediately stream them, so an idle pull means its readers
+went away. After the last detach, a 10 second linger gives a flapping
+client room to rejoin (a fully stalled upstream still resolves through
+the download's idle timeout).
 
 ### TLS Configuration
 

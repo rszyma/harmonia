@@ -1,12 +1,15 @@
 //! Pull-through fetching from upstream binary caches, with progressive
 //! serving.
 //!
-//! The first request for a missing path starts a single download of the
-//! upstream NAR into a temp file; concurrent requests for the same path
-//! stream the growing file instead of waiting for a full import. When the
-//! download completes, the path is imported into the local store with
-//! `nix copy`, preserving the upstream signatures that Nix records. Later
-//! requests are served from the store normally.
+//! A narinfo miss is proxied from upstream with its `URL:` rewritten to
+//! this cache's canonical NAR route. The client's follow-up NAR request
+//! starts a single download of the upstream NAR into a temp file;
+//! concurrent requests for the same path stream the growing file instead
+//! of waiting for a full import. When the download completes, the path
+//! is imported into the local store with `nix copy`, preserving the
+//! upstream signatures that Nix records. Later requests are served from
+//! the store normally. Narinfo-only clients never trigger a download:
+//! pulls start exclusively on NAR requests.
 //!
 //! Why a temp file and not an in-memory pool: downloader, client readers and
 //! importer are fully decoupled and never block each other. The downloader
@@ -54,12 +57,12 @@ pub(crate) enum Download {
 
 /// One in-flight upstream download. The temp dir (NAR file plus import
 /// staging) is deleted when the last reference — readers included — drops.
+/// Carries no narinfo: pulls are spawned by NAR requests, which already
+/// know their store hash, and the task re-fetches the narinfo itself.
 #[derive(Debug)]
 pub(crate) struct ActiveDownload {
     dir: tempfile::TempDir,
     nar_path: PathBuf,
-    /// Upstream narinfo bytes, served verbatim until the import lands.
-    pub(crate) narinfo: String,
     /// Bumped on every progress event. Unlike `Notify`, a watch version
     /// cannot be missed by a reader that checks the file first and waits
     /// after: any missed bump still counts as newer on the next check.
@@ -70,19 +73,16 @@ pub(crate) struct ActiveDownload {
     /// NAR streams currently attached. Only streaming readers count:
     /// narinfo responses complete immediately and hold nothing.
     readers: AtomicUsize,
-    /// Whether a reader ever attached. Together with `readers` this tells
-    /// the download task whether any downstream was (or still is)
-    /// interested; cancellation requires a disconnect, so a pull nobody
-    /// ever streamed is never abandoned.
-    had_readers: AtomicBool,
-    /// Last time a reader attached or detached (creation time if never).
+    /// Last time a reader attached or detached (creation time, which is
+    /// effectively attach time: every pull is born from a NAR request that
+    /// immediately streams it).
     /// Together with `readers` this tells the download task whether any
     /// downstream is still interested.
     last_reader_seen: Mutex<Instant>,
 }
 
 impl ActiveDownload {
-    fn new(narinfo: String) -> io::Result<Self> {
+    fn new() -> io::Result<Self> {
         let dir = tempfile::TempDir::new()?;
         let nar_path = dir.path().join("data.nar");
         // Reserve the name up front so readers never observe a missing file.
@@ -91,13 +91,11 @@ impl ActiveDownload {
         Ok(Self {
             dir,
             nar_path,
-            narinfo,
             progress,
             generation: AtomicU64::new(0),
             done: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             readers: AtomicUsize::new(0),
-            had_readers: AtomicBool::new(false),
             last_reader_seen: Mutex::new(Instant::now()),
         })
     }
@@ -135,17 +133,14 @@ impl ActiveDownload {
     }
 
     /// Whether the download must be abandoned: the cancel policy is on,
-    /// a reader attached at least once and then every reader detached,
-    /// and the last detach is older than `linger`. Cancellation requires
-    /// a disconnect, not merely an idle download: nix pipelines narinfo
-    /// queries far ahead of NAR fetches, so a queued path's NAR routinely
-    /// starts long after its narinfo was served. A pull nobody ever
-    /// streamed always runs to completion. The linger only debounces
+    /// no reader is attached, and the last detach (or pull birth, which
+    /// is effectively attach time) is older than `linger`. Every pull is
+    /// born from a NAR request that immediately streams it, so an idle
+    /// pull means its readers disconnected. The linger only debounces
     /// genuine disconnects, so a flapping reader does not kill a pull
     /// another client is about to rejoin.
     fn should_cancel(&self, enabled: bool, linger: Duration) -> bool {
         enabled
-            && self.had_readers.load(Ordering::Acquire)
             && self.readers.load(Ordering::Acquire) == 0
             && self
                 .last_reader_seen
@@ -165,7 +160,6 @@ struct ReaderGuard {
 impl ReaderGuard {
     fn new(dl: &Arc<ActiveDownload>) -> Self {
         dl.readers.fetch_add(1, Ordering::Release);
-        dl.had_readers.store(true, Ordering::Release);
         Self { dl: dl.clone() }
     }
 }
@@ -242,7 +236,9 @@ impl PullThrough {
     }
 
     /// Resolve a missing hash: already local, being downloaded, or absent.
-    /// Starts at most one download per hash; concurrent requests attach to it.
+    /// Starts at most one download per hash; concurrent requests attach to
+    /// it. Spawns without fetching anything: the task re-fetches the
+    /// narinfo itself, so the NAR response starts streaming immediately.
     pub(crate) async fn get_or_start(settings: &web::Data<Config>, hash: &str) -> Download {
         let pull = &settings.pull_through;
         if !pull.enabled() {
@@ -264,14 +260,7 @@ impl PullThrough {
         if let Some(dl) = pull.downloads.lock().expect("lock poisoned").get(hash) {
             return Download::Streaming(dl.clone());
         }
-        let Some((upstream, narinfo_text)) = pull.fetch_narinfo(hash).await else {
-            return Download::Absent;
-        };
-        let Some(path) = parse_store_path(&narinfo_text) else {
-            tracing::warn!("pull-through: narinfo from {upstream} has no StorePath");
-            return Download::Absent;
-        };
-        let dl = match ActiveDownload::new(narinfo_text.clone()) {
+        let dl = match ActiveDownload::new() {
             Ok(dl) => Arc::new(dl),
             Err(e) => {
                 tracing::warn!("pull-through: failed creating temp file: {e}");
@@ -284,47 +273,23 @@ impl PullThrough {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let task_settings = settings.clone();
                     let task_hash = hash.to_string();
-                    tokio::spawn(run_download(
-                        task_settings,
-                        task_hash,
-                        dl.clone(),
-                        path,
-                        (upstream, narinfo_text),
-                    ));
+                    tokio::spawn(run_download(task_settings, task_hash, dl.clone()));
                     entry.insert(dl).clone()
                 }
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    // A racing request inserted first; use the winner. Note
-                    // `path`, `upstream` and `narinfo_text` then go unused:
-                    // all racing requests name the same store path.
-                    entry.get().clone()
-                }
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
             }
         };
         Download::Streaming(dl)
     }
 
     /// Fetch `<hash>.narinfo` from the first upstream that has it.
-    async fn fetch_narinfo(&self, hash: &str) -> Option<(Url, String)> {
+    pub(crate) async fn fetch_narinfo(&self, hash: &str) -> Option<(Url, String)> {
         for upstream in &self.upstreams {
             if let Some(text) = self.fetch_narinfo_from(upstream, hash).await {
                 return Some((upstream.clone(), text));
             }
         }
         None
-    }
-
-    /// Find the in-flight download whose upstream file `candidate` names.
-    /// `candidate` is a request path (`/nar/...`); it matches when the
-    /// download's narinfo `URL:` is the same relative path (query
-    /// stripped). Absolute upstream URLs never match: the client fetches
-    /// those straight from the upstream, bypassing this cache.
-    pub(crate) fn find_by_nar_path(&self, candidate: &str) -> Option<Arc<ActiveDownload>> {
-        let downloads = self.downloads.lock().expect("lock poisoned");
-        downloads
-            .values()
-            .find(|dl| nar_request_path(&dl.narinfo).as_deref() == Some(candidate))
-            .cloned()
     }
 
     /// GET with redirect following (up to 10 hops; GET is safe to repeat).
@@ -492,14 +457,10 @@ impl Drop for FinishGuard<'_> {
     }
 }
 
-/// Download the NAR (failing over across upstreams), then import it.
-async fn run_download(
-    settings: web::Data<Config>,
-    hash: String,
-    dl: Arc<ActiveDownload>,
-    path: StorePath,
-    primary: (Url, String),
-) {
+/// Download the NAR (failing over across upstreams), then import it. The
+/// narinfo is (re-)fetched inside the task: NAR requests carry only the
+/// store hash, so the mapping is resolved here, keyed by it.
+async fn run_download(settings: web::Data<Config>, hash: String, dl: Arc<ActiveDownload>) {
     let _cleanup = FinishGuard {
         downloads: &settings.pull_through.downloads,
         hash: hash.clone(),
@@ -511,13 +472,13 @@ async fn run_download(
             dl.mark_failed();
             return;
         }
-        let narinfo_text = if *upstream == primary.0 {
-            primary.1.clone()
-        } else {
-            match pull.fetch_narinfo_from(upstream, &hash).await {
-                Some(text) => text,
-                None => continue,
-            }
+        let narinfo_text = match pull.fetch_narinfo_from(upstream, &hash).await {
+            Some(text) => text,
+            None => continue,
+        };
+        let Some(path) = parse_store_path(&narinfo_text) else {
+            tracing::warn!("pull-through: narinfo from {upstream} has no StorePath");
+            continue;
         };
         let Some(nar_url) = parse_nar_url(&narinfo_text, upstream) else {
             continue;
@@ -745,19 +706,36 @@ fn parse_store_path(narinfo: &str) -> Option<StorePath> {
         .and_then(|base| StorePath::from_base_path(base).ok())
 }
 
-/// The request path a client uses for a narinfo's file, if it routes
-/// through this cache: relative `URL:` values stay relative (query
-/// stripped, leading slash normalized); absolute URLs return `None`.
-fn nar_request_path(narinfo: &str) -> Option<String> {
-    let url = narinfo
+/// Rewrite an upstream narinfo's `URL:` to this cache's canonical NAR
+/// route, so the client's follow-up request lands on the existing
+/// `/nar/<narhash>.nar?hash=` handler — which streams the in-flight pull
+/// or serves the store — instead of a filename only the upstream routes.
+/// Everything else stays verbatim, so hashes and signatures keep matching
+/// the downloaded bytes. `None` when the narinfo names no usable NAR
+/// hash (the caller then serves it verbatim; unroutable names 404 and
+/// the client falls back, absolute URLs fetch direct as before).
+pub(crate) fn canonical_narinfo(narinfo: &str, outhash: &str) -> Option<String> {
+    let narhash = narinfo
         .lines()
-        .filter_map(|line| line.strip_prefix("URL: "))
+        .filter_map(|line| line.strip_prefix("NarHash: sha256:"))
         .next()?;
-    if url.starts_with("http://") || url.starts_with("https://") {
+    if narhash.len() != 52
+        || !narhash
+            .bytes()
+            .all(|b| harmonia_utils_base_encoding::base32::ALPHABET.contains(b as char))
+    {
         return None;
     }
-    let path = url.split('?').next()?;
-    Some(format!("/{}", path.trim_start_matches('/')))
+    let mut out = String::new();
+    for line in narinfo.lines() {
+        if line.starts_with("URL: ") {
+            out.push_str(&format!("URL: nar/{narhash}.nar?hash={outhash}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 /// Resolve the narinfo's `URL:` field against the upstream base URL.
@@ -871,23 +849,46 @@ mod tests {
     }
 
     #[test]
-    fn request_path_stays_relative() {
-        assert_eq!(
-            nar_request_path("URL: nar/abc.nar.zst\n").as_deref(),
-            Some("/nar/abc.nar.zst")
+    fn rewrites_upstream_url_to_canonical() {
+        let narhash = "abcd".repeat(13);
+        assert_eq!(narhash.len(), 52);
+        let outhash = "0123456789abcdfghijklmnpqrsvwxyz";
+        let narinfo = format!(
+            "StorePath: /nix/store/abc-widget\n\
+             URL: nar/blob.bin\n\
+             NarHash: sha256:{narhash}\n\
+             NarSize: 1\n"
         );
-        // Query strings (e.g. harmonia's own `?hash=`) are not part of
-        // the routed path.
         assert_eq!(
-            nar_request_path("URL: nar/abc.nar?hash=test\n").as_deref(),
-            Some("/nar/abc.nar")
+            canonical_narinfo(&narinfo, outhash).as_deref(),
+            Some(
+                format!(
+                    "StorePath: /nix/store/abc-widget\n\
+                 URL: nar/{narhash}.nar?hash={outhash}\n\
+                 NarHash: sha256:{narhash}\n\
+                 NarSize: 1\n"
+                )
+                .as_str()
+            )
         );
-        // Absolute upstream URLs bypass this cache; nothing to route.
+        // Absolute upstream URLs rewrite the same way: the client then
+        // pulls through us instead of fetching direct.
+        let narinfo = narinfo.replace("URL: nar/blob.bin", "URL: https://s3.example/nar/x.nar");
+        assert!(
+            canonical_narinfo(&narinfo, outhash)
+                .expect("rewritten")
+                .contains(&format!("URL: nar/{narhash}.nar?hash=")),
+        );
+        // No usable NAR hash: leave the narinfo alone (verbatim serves
+        // absolute URLs direct; unroutable relatives 404 and fall back).
         assert_eq!(
-            nar_request_path("URL: https://s3.example/nar/x.nar\n"),
+            canonical_narinfo("StorePath: /nix/store/a-b\n", "abc"),
             None
         );
-        assert_eq!(nar_request_path("StorePath: /nix/store/a-b\n"), None);
+        assert_eq!(
+            canonical_narinfo("URL: nar/x.nar\nNarHash: sha256:short\n", "abc"),
+            None
+        );
     }
 
     #[test]
@@ -904,12 +905,7 @@ mod tests {
         use futures_util::StreamExt as _;
         use tokio::io::AsyncWriteExt as _;
 
-        let dl = Arc::new(
-            ActiveDownload::new(
-                "StorePath: /nix/store/0123456789abcdfghijklmnpqrsvwxyz-widget\n".to_string(),
-            )
-            .expect("temp dir"),
-        );
+        let dl = Arc::new(ActiveDownload::new().expect("temp dir"));
         // Feed the file in two chunks with a delay: the reader must see
         // the first chunk before the download is marked done.
         let writer = dl.clone();
@@ -947,10 +943,7 @@ mod tests {
 
     #[test]
     fn reader_guard_counts_attachment() {
-        let dl = Arc::new(
-            ActiveDownload::new("StorePath: /nix/store/abc-widget\n".to_string())
-                .expect("temp dir"),
-        );
+        let dl = Arc::new(ActiveDownload::new().expect("temp dir"));
         assert_eq!(dl.readers.load(Ordering::Acquire), 0);
         let first = ReaderGuard::new(&dl);
         let second = ReaderGuard::new(&dl);
@@ -964,16 +957,9 @@ mod tests {
     #[test]
     fn cancels_only_after_a_disconnect() {
         use std::time::Duration;
-        let dl = Arc::new(
-            ActiveDownload::new("StorePath: /nix/store/abc-widget\n".to_string())
-                .expect("temp dir"),
-        );
+        let dl = Arc::new(ActiveDownload::new().expect("temp dir"));
         // Policy off: never cancels, however idle.
         assert!(!dl.should_cancel(false, Duration::ZERO));
-        // Never streamed, however idle: no disconnect happened, no cancel.
-        // (nix pipelines narinfos far ahead of NAR fetches; a queued NAR
-        // routinely starts minutes after its narinfo was served.)
-        assert!(!dl.should_cancel(true, Duration::ZERO));
         // An attached reader suppresses cancellation however idle.
         let _reader = ReaderGuard::new(&dl);
         assert!(!dl.should_cancel(true, Duration::ZERO));

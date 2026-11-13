@@ -6,7 +6,7 @@ use harmonia_store_path_info::StorePathKeyed;
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::pull_through::{Download, PullThrough};
+use crate::pull_through::canonical_narinfo;
 use crate::{cache_control_max_age_1d, some_or_404};
 
 #[derive(Debug, Deserialize)]
@@ -35,40 +35,37 @@ pub(crate) async fn get(
         .query_path_info_by_hash_part(&store_path_hash)?
     {
         Some(info) => Some(info),
-        None => match PullThrough::get_or_start(&settings, &hash).await {
-            Download::Absent => {
+        None => {
+            if !settings.pull_through.enabled() {
                 return Ok(HttpResponse::NotFound()
                     .insert_header(crate::cache_control_no_store())
                     .body("missed hash"));
             }
-            // The import may have finished concurrently; re-check.
-            Download::Present => settings
-                .store
-                .query_path_info_by_hash_part(&store_path_hash)?,
-            Download::Streaming(dl) => {
-                match settings
-                    .store
-                    .query_path_info_by_hash_part(&store_path_hash)?
-                {
-                    Some(info) => Some(info),
-                    None => {
-                        upstream_narinfo = Some(dl.narinfo.clone());
-                        None
-                    }
+            // Lazy pull-through: proxy the upstream narinfo with our
+            // canonical URL, but start nothing. The client's NAR request
+            // spawns the pull. It carries the upstream signatures, so
+            // clients verify it exactly as if they had fetched it
+            // upstream. JSON narinfos can't be rebuilt pre-import; let
+            // those fall back.
+            if param.json.is_some() {
+                return Ok(HttpResponse::NotFound()
+                    .insert_header(crate::cache_control_no_store())
+                    .body("missed hash"));
+            }
+            match settings.pull_through.fetch_narinfo(&hash).await {
+                Some((_, text)) => {
+                    upstream_narinfo = Some(canonical_narinfo(&text, &hash).unwrap_or(text));
+                    None
+                }
+                None => {
+                    return Ok(HttpResponse::NotFound()
+                        .insert_header(crate::cache_control_no_store())
+                        .body("missed hash"));
                 }
             }
-        },
+        }
     };
     if let Some(narinfo_text) = upstream_narinfo {
-        // The download is still running: serve the upstream narinfo
-        // verbatim. It carries the upstream signatures, so clients
-        // verify it exactly as if they had fetched it upstream. JSON
-        // narinfos can't be rebuilt mid-download; let those fall back.
-        if param.json.is_some() {
-            return Ok(HttpResponse::NotFound()
-                .insert_header(crate::cache_control_no_store())
-                .body("missed hash"));
-        }
         return Ok(HttpResponse::Ok()
             .insert_header((http::header::CONTENT_TYPE, "text/x-nix-narinfo"))
             .insert_header(cache_control_max_age_1d())
