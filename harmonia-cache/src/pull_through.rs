@@ -35,9 +35,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
 use url::Url;
@@ -67,6 +67,13 @@ pub(crate) struct ActiveDownload {
     generation: AtomicU64,
     done: AtomicBool,
     failed: AtomicBool,
+    /// NAR streams currently attached. Only streaming readers count:
+    /// narinfo responses complete immediately and hold nothing.
+    readers: AtomicUsize,
+    /// Last time a reader attached or detached (creation time if never).
+    /// Together with `readers` this tells the download task whether any
+    /// downstream is still interested.
+    last_reader_seen: Mutex<Instant>,
 }
 
 impl ActiveDownload {
@@ -84,6 +91,8 @@ impl ActiveDownload {
             generation: AtomicU64::new(0),
             done: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            readers: AtomicUsize::new(0),
+            last_reader_seen: Mutex::new(Instant::now()),
         })
     }
 
@@ -118,16 +127,63 @@ impl ActiveDownload {
     fn is_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
+
+    /// Whether the download must be abandoned: the cancel policy is on and
+    /// no reader has been attached for longer than `linger`. The linger
+    /// covers the normal gap between a client's narinfo request (which
+    /// holds no reader) and its follow-up NAR request, so only genuinely
+    /// uninterested downloads — disconnected readers, narinfo-only clients
+    /// that never come back for the NAR — are cancelled.
+    fn should_cancel(&self, enabled: bool, linger: Duration) -> bool {
+        enabled
+            && self.readers.load(Ordering::Acquire) == 0
+            && self
+                .last_reader_seen
+                .lock()
+                .expect("lock poisoned")
+                .elapsed()
+                >= linger
+    }
 }
+
+/// Counts one attached NAR reader for as long as it is held. Dropping the
+/// response stream (client disconnect) detaches automatically.
+struct ReaderGuard {
+    dl: Arc<ActiveDownload>,
+}
+
+impl ReaderGuard {
+    fn new(dl: &Arc<ActiveDownload>) -> Self {
+        dl.readers.fetch_add(1, Ordering::Release);
+        Self { dl: dl.clone() }
+    }
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.dl.readers.fetch_sub(1, Ordering::Release);
+        *self.dl.last_reader_seen.lock().expect("lock poisoned") = Instant::now();
+    }
+}
+
+/// Reattach window before an unread download is cancelled. Generous next
+/// to the millisecond-scale narinfo-to-NAR gap of a normal client.
+const READER_LINGER: Duration = Duration::from_secs(10);
 
 type HyperClient = hyper_util::client::legacy::Client<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     http_body_util::Full<bytes::Bytes>,
 >;
 
+/// Global for all upstreams: what a download does when it loses its last
+/// downstream reader. `false` (default) keeps the current behavior — the
+/// download runs to completion in the background and warms the cache;
+/// `true` aborts it, so disconnected clients stop costing upstream
+/// traffic. Either way a later request simply starts a fresh download.
 #[derive(Debug)]
 pub(crate) struct PullThrough {
     upstreams: Vec<Url>,
+    cancel_on_disconnect: bool,
     client: HyperClient,
     downloads: Mutex<HashMap<String, Arc<ActiveDownload>>>,
 }
@@ -136,6 +192,7 @@ impl Default for PullThrough {
     fn default() -> Self {
         Self {
             upstreams: Vec::new(),
+            cancel_on_disconnect: false,
             client: default_client(),
             downloads: Mutex::new(HashMap::new()),
         }
@@ -154,7 +211,7 @@ fn default_client() -> HyperClient {
 }
 
 impl PullThrough {
-    pub(crate) fn new(upstreams: Vec<Url>) -> Result<Self, String> {
+    pub(crate) fn new(upstreams: Vec<Url>, cancel_on_disconnect: bool) -> Result<Self, String> {
         for upstream in &upstreams {
             if upstream.scheme() != "http" && upstream.scheme() != "https" {
                 return Err(format!("upstream_caches: unsupported scheme in {upstream}"));
@@ -163,6 +220,7 @@ impl PullThrough {
         let client = default_client();
         Ok(Self {
             upstreams,
+            cancel_on_disconnect,
             client,
             downloads: Mutex::new(HashMap::new()),
         })
@@ -321,6 +379,7 @@ impl PullThrough {
     pub(crate) async fn stream_nar(
         dl: Arc<ActiveDownload>,
     ) -> io::Result<impl futures_core::Stream<Item = Result<bytes::Bytes, io::Error>> + Send> {
+        let reader = ReaderGuard::new(&dl);
         let file = tokio::fs::File::open(&dl.nar_path).await?;
         let progress = dl.subscribe();
         Ok(unfold(
@@ -330,6 +389,9 @@ impl PullThrough {
                 dl,
                 progress,
                 failed: false,
+                // Held for the stream's lifetime: dropping the stream
+                // (client disconnect) detaches the reader.
+                _reader: reader,
             },
             |mut st| async move {
                 if st.failed {
@@ -388,6 +450,7 @@ struct ReaderState {
     dl: Arc<ActiveDownload>,
     progress: watch::Receiver<u64>,
     failed: bool,
+    _reader: ReaderGuard,
 }
 
 /// Remove the map entry when the download task ends, on every exit path.
@@ -419,6 +482,11 @@ async fn run_download(
     };
     let pull = &settings.pull_through;
     for upstream in &pull.upstreams {
+        if dl.should_cancel(pull.cancel_on_disconnect, READER_LINGER) {
+            tracing::info!("pull-through: all readers gone, cancelling download of {hash}");
+            dl.mark_failed();
+            return;
+        }
         let narinfo_text = if *upstream == primary.0 {
             primary.1.clone()
         } else {
@@ -432,17 +500,37 @@ async fn run_download(
         };
         match download_to_file(pull, &nar_url, &dl).await {
             Ok(()) => {
+                if dl.should_cancel(pull.cancel_on_disconnect, READER_LINGER) {
+                    tracing::info!("pull-through: all readers gone, skipping import of {hash}");
+                    dl.mark_failed();
+                    return;
+                }
                 dl.mark_done();
-                import_staged(&settings.store, &dl, &hash, &path, &narinfo_text).await;
+                import_staged(&settings.store, pull, &dl, &hash, &path, &narinfo_text).await;
                 return;
             }
             Err(e) => {
+                if dl.should_cancel(pull.cancel_on_disconnect, READER_LINGER) {
+                    tracing::info!("pull-through: all readers gone, cancelling pull of {hash}");
+                    dl.mark_failed();
+                    return;
+                }
                 tracing::warn!("pull-through: download of {nar_url} failed: {e}");
                 continue;
             }
         }
     }
     dl.mark_failed();
+}
+
+/// Resolves when the download must be abandoned under the cancel policy.
+/// With the policy off it never resolves, so `select!` just waits on the
+/// other branch. Polled at 1s granularity: prompt next to the 10s linger
+/// without waking the task per chunk.
+async fn cancelled(dl: &ActiveDownload, enabled: bool) {
+    while !dl.should_cancel(enabled, READER_LINGER) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Fetch one NAR straight into the temp file, notifying readers per chunk.
@@ -459,10 +547,18 @@ async fn download_to_file(
     let mut file = tokio::fs::File::create(&dl.nar_path).await?;
     loop {
         // Idle timeout per chunk: a stalled upstream aborts instead of
-        // hanging the download (and its readers) forever.
-        let frame = tokio::time::timeout(Duration::from_secs(60), body.frame())
-            .await
-            .map_err(|_| io::Error::other(format!("upstream {nar_url} stalled")))?;
+        // hanging the download (and its readers) forever. The cancel
+        // branch also fires while blocked on a slow upstream, so an
+        // unread download is abandoned promptly instead of at the next
+        // chunk.
+        let frame = tokio::select! {
+            biased;
+            _ = cancelled(dl, pull.cancel_on_disconnect) => {
+                return Err(io::Error::other("all readers disconnected"));
+            }
+            frame = tokio::time::timeout(Duration::from_secs(60), body.frame()) => frame
+                .map_err(|_| io::Error::other(format!("upstream {nar_url} stalled")))?,
+        };
         let Some(frame) = frame else {
             break;
         };
@@ -484,6 +580,7 @@ async fn download_to_file(
 /// Staging layout mirrors a binary cache; the NAR is hardlinked, not copied.
 async fn import_staged(
     store: &Store,
+    pull: &PullThrough,
     dl: &ActiveDownload,
     hash: &str,
     path: &StorePath,
@@ -540,15 +637,54 @@ async fn import_staged(
     }
     command.arg(&path_str);
 
-    let output = match command.output().await {
-        Ok(output) => output,
+    let mut child = match command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
         Err(e) => {
             tracing::error!("pull-through: failed to run `nix copy`: {e}");
             return false;
         }
     };
-    if !output.status.success() {
-        let stderr: String = String::from_utf8_lossy(&output.stderr)
+    // Drain stderr concurrently so `nix copy` can never block on a full
+    // pipe while polled below.
+    let mut stderr = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(ref mut pipe) = stderr {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    // Poll for exit so a disconnect during the import kills `nix copy`
+    // instead of letting it finish: an interrupted copy never leaves a
+    // valid store path, so abandoning it is safe. Readers racing the kill
+    // see `failed`.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("pull-through: failed waiting for `nix copy`: {e}");
+                let _ = child.kill().await;
+                stderr_task.abort();
+                return false;
+            }
+        }
+        if dl.should_cancel(pull.cancel_on_disconnect, READER_LINGER) {
+            tracing::info!("pull-through: all readers gone, killing import of {hash}");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            dl.mark_failed();
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    if !status.success() {
+        let stderr: String = String::from_utf8_lossy(&stderr_task.await.unwrap_or_default())
             .lines()
             .next()
             .unwrap_or("")
@@ -748,6 +884,39 @@ mod tests {
             rest.extend_from_slice(&chunk.expect("no error"));
         }
         assert_eq!(rest, b"second");
+    }
+
+    #[test]
+    fn reader_guard_counts_attachment() {
+        let dl = Arc::new(
+            ActiveDownload::new("StorePath: /nix/store/abc-widget\n".to_string())
+                .expect("temp dir"),
+        );
+        assert_eq!(dl.readers.load(Ordering::Acquire), 0);
+        let first = ReaderGuard::new(&dl);
+        let second = ReaderGuard::new(&dl);
+        assert_eq!(dl.readers.load(Ordering::Acquire), 2);
+        drop(first);
+        assert_eq!(dl.readers.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(dl.readers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cancels_only_without_recent_readers() {
+        use std::time::Duration;
+        let dl = ActiveDownload::new("StorePath: /nix/store/abc-widget\n".to_string())
+            .expect("temp dir");
+        // Policy off: never cancels, however idle.
+        assert!(!dl.should_cancel(false, Duration::ZERO));
+        // Policy on but freshly created (linger not yet elapsed): no cancel.
+        assert!(!dl.should_cancel(true, Duration::from_secs(3600)));
+        // Linger elapsed and no reader ever attached: cancel.
+        assert!(dl.should_cancel(true, Duration::ZERO));
+        // An attached reader suppresses cancellation however idle.
+        let dl = Arc::new(dl);
+        let _reader = ReaderGuard::new(&dl);
+        assert!(!dl.should_cancel(true, Duration::ZERO));
     }
 
     #[test]

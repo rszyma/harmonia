@@ -135,6 +135,16 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) upstream_caches: Vec<Url>,
 
+    /// Global for all upstream caches: abandon an in-progress pull once it
+    /// has no downstream reader left. Cancellation fires only after no
+    /// reader has been attached for 10 seconds, so the normal gap between
+    /// a client's narinfo request and its follow-up NAR request does not
+    /// abort the download. `false` (default) keeps the download running in
+    /// the background to completion, warming the cache. Either way a later
+    /// request simply starts a fresh download.
+    #[serde(default)]
+    pub(crate) upstream_cancel_on_disconnect: bool,
+
     #[serde(default)]
     pub(crate) sign_key_path: Option<String>,
     #[serde(default)]
@@ -265,8 +275,11 @@ pub(crate) fn load() -> Result<Config> {
         .into());
     }
     settings.store = Store::new(store_dir, settings.real_nix_store.clone(), db_path);
-    settings.pull_through = PullThrough::new(settings.upstream_caches.clone())
-        .map_err(|e| ConfigError::Invalid { reason: e })?;
+    settings.pull_through = PullThrough::new(
+        settings.upstream_caches.clone(),
+        settings.upstream_cancel_on_disconnect,
+    )
+    .map_err(|e| ConfigError::Invalid { reason: e })?;
     Ok(settings)
 }
 

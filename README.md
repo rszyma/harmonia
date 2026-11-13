@@ -189,6 +189,15 @@ on `PATH`, and the service user needs permission to import into the store.
 On NixOS, use `services.harmonia-dev.cache.pullThrough` (see below), which
 relaxes the service sandbox accordingly.
 
+By default a pull runs to completion in the background even if the client
+that triggered it disconnects, warming the cache for the next request. Set
+`upstream_cancel_on_disconnect = true` (global for all upstream caches) to
+abandon a pull instead once it has no downstream reader left — a later
+request simply starts a fresh download. Cancellation fires only after 10
+seconds without a reader, so the normal gap between a client's narinfo
+request and its follow-up NAR request does not abort the download (a fully
+stalled upstream still resolves through the download's idle timeout).
+
 ### TLS Configuration
 
 Harmonia can serve content over HTTPS without requiring a reverse proxy. To enable TLS, specify the paths to your certificate and private key files in the configuration:

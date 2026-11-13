@@ -70,6 +70,13 @@ in
             example = [ "https://cache.nixos.org" ];
             description = "Upstream binary caches to pull missing store paths from. The first upstream that has a requested path is imported with `nix copy`, so the cache host accumulates everything it serves. Importing trusts the upstream signatures through the host's `trusted-public-keys`.";
           };
+
+          cancelOnDisconnect = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            example = true;
+            description = "Abandon an in-progress pull once it has no downstream reader left, instead of finishing it in the background (global for all upstream caches). Cancellation fires only after 10 seconds without a reader, so the normal gap between a client's narinfo request and its follow-up NAR request does not abort the download. A later request simply starts a fresh download.";
+          };
         };
 
         settings = lib.mkOption {
@@ -138,6 +145,8 @@ in
   config = lib.mkMerge [
     (lib.mkIf (cacheCfg.enable && cacheCfg.pullThrough.enable) {
       services.harmonia-dev.cache.settings.upstream_caches = cacheCfg.pullThrough.upstreamCaches;
+      services.harmonia-dev.cache.settings.upstream_cancel_on_disconnect =
+        cacheCfg.pullThrough.cancelOnDisconnect;
     })
     (lib.mkIf cacheCfg.enable {
       warnings =
