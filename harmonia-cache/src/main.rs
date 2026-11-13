@@ -165,6 +165,9 @@ async fn inner_main() -> Result<()> {
         "/nar/{{outhash:[{a}]{{32}}}}-{{narhash:[{a}]{{52}}}}.nar",
         a = harmonia_utils_base_encoding::base32::ALPHABET
     );
+    // Upstream file names outside the routes above (e.g. c.n.o's
+    // nar/<file>.nar.zst); streams in-flight pulls, 404s otherwise.
+    let pull_through_nar_route = "/nar/{tail:.*}";
     let mut server = HttpServer::new(move || {
         App::new()
             .wrap(middleware::Condition::new(
@@ -184,6 +187,8 @@ async fn inner_main() -> Result<()> {
             .route(&nar_route, web::head().to(nar::get))
             .route(&nix_serve_nar_route, web::get().to(nar::get))
             .route(&nix_serve_nar_route, web::head().to(nar::get))
+            .route(&pull_through_nar_route, web::get().to(nar::get_inflight))
+            .route(&pull_through_nar_route, web::head().to(nar::get_inflight))
             .route("/serve/{hash}{path:.*}", web::get().to(serve::get))
             .route("/serve/{hash}{path:.*}", web::head().to(serve::get))
             .route("/log/{drv}", web::get().to(buildlog::get))

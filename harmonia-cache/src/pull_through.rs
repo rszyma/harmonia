@@ -303,6 +303,19 @@ impl PullThrough {
         None
     }
 
+    /// Find the in-flight download whose upstream file `candidate` names.
+    /// `candidate` is a request path (`/nar/...`); it matches when the
+    /// download's narinfo `URL:` is the same relative path (query
+    /// stripped). Absolute upstream URLs never match: the client fetches
+    /// those straight from the upstream, bypassing this cache.
+    pub(crate) fn find_by_nar_path(&self, candidate: &str) -> Option<Arc<ActiveDownload>> {
+        let downloads = self.downloads.lock().expect("lock poisoned");
+        downloads
+            .values()
+            .find(|dl| nar_request_path(&dl.narinfo).as_deref() == Some(candidate))
+            .cloned()
+    }
+
     /// GET with redirect following (up to 10 hops; GET is safe to repeat).
     /// Each hop gets its own 30s budget. Only http(s) targets are followed.
     async fn request(&self, url: &str) -> io::Result<hyper::Response<hyper::body::Incoming>> {
@@ -721,6 +734,21 @@ fn parse_store_path(narinfo: &str) -> Option<StorePath> {
         .and_then(|base| StorePath::from_base_path(base).ok())
 }
 
+/// The request path a client uses for a narinfo's file, if it routes
+/// through this cache: relative `URL:` values stay relative (query
+/// stripped, leading slash normalized); absolute URLs return `None`.
+fn nar_request_path(narinfo: &str) -> Option<String> {
+    let url = narinfo
+        .lines()
+        .filter_map(|line| line.strip_prefix("URL: "))
+        .next()?;
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return None;
+    }
+    let path = url.split('?').next()?;
+    Some(format!("/{}", path.trim_start_matches('/')))
+}
+
 /// Resolve the narinfo's `URL:` field against the upstream base URL.
 fn parse_nar_url(narinfo: &str, upstream: &Url) -> Option<String> {
     let url = narinfo
@@ -829,6 +857,26 @@ mod tests {
     fn rejects_narinfo_without_store_path() {
         assert!(parse_store_path("URL: nar/xyz.nar\n").is_none());
         assert!(parse_store_path("").is_none());
+    }
+
+    #[test]
+    fn request_path_stays_relative() {
+        assert_eq!(
+            nar_request_path("URL: nar/abc.nar.zst\n").as_deref(),
+            Some("/nar/abc.nar.zst")
+        );
+        // Query strings (e.g. harmonia's own `?hash=`) are not part of
+        // the routed path.
+        assert_eq!(
+            nar_request_path("URL: nar/abc.nar?hash=test\n").as_deref(),
+            Some("/nar/abc.nar")
+        );
+        // Absolute upstream URLs bypass this cache; nothing to route.
+        assert_eq!(
+            nar_request_path("URL: https://s3.example/nar/x.nar\n"),
+            None
+        );
+        assert_eq!(nar_request_path("StorePath: /nix/store/a-b\n"), None);
     }
 
     #[test]

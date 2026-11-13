@@ -291,8 +291,12 @@ struct SlowFixture {
 }
 
 /// Real signed upstream for narinfo bytes + NAR content, but the main
-/// cache pulls through a gated slow server standing in front of it.
-async fn setup_slow(cancel_on_disconnect: bool) -> Result<SlowFixture> {
+/// cache pulls through a dripping slow server standing in front of it.
+/// `url_override` rewrites the narinfo `URL:` line, simulating upstreams
+/// (like cache.nixos.org) whose file names fall outside harmonia's own
+/// URL scheme. The rewrite is signature-safe: signatures do not cover
+/// the URL field (the import staging relies on the same fact).
+async fn setup_slow(cancel_on_disconnect: bool, url_override: Option<&str>) -> Result<SlowFixture> {
     let temp_dir = CanonicalTempDir::new()?;
     let root = temp_dir.path().to_path_buf();
     let store_dir = root.join("store");
@@ -322,18 +326,34 @@ async fn setup_slow(cancel_on_disconnect: bool) -> Result<SlowFixture> {
     let upstream_url = format!("http://127.0.0.1:{upstream_port}");
 
     // Signed narinfo and exact NAR bytes, straight from the real upstream.
-    // The narinfo passes through the slow server byte-identical, so its
-    // signature stays valid and recovery can import.
-    let narinfo = curl_bytes(&format!("{upstream_url}/{hash}.narinfo")).await?;
-    let nar_path = nar_url_path_from(&String::from_utf8(narinfo.clone())?)?;
-    let nar_bytes = curl_bytes(&format!("{upstream_url}/{nar_path}")).await?;
+    // The narinfo passes through the slow server byte-identical (apart
+    // from the optional URL rewrite), so its signature stays valid and
+    // recovery can import.
+    let narinfo = String::from_utf8(curl_bytes(&format!("{upstream_url}/{hash}.narinfo")).await?)?;
+    let nar_bytes = curl_bytes(&format!("{upstream_url}/{}", nar_url_path_from(&narinfo)?)).await?;
+    let narinfo = if let Some(url) = url_override {
+        narinfo
+            .lines()
+            .map(|line| {
+                if line.starts_with("URL: ") {
+                    format!("URL: {url}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    } else {
+        narinfo
+    };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let slow_port = listener.local_addr()?.port();
     let hits = Arc::new(AtomicUsize::new(0));
     let slow_task = tokio::spawn(run_slow_upstream(
         listener,
-        narinfo,
+        narinfo.into_bytes(),
         nar_bytes.clone(),
         hits.clone(),
     ));
@@ -425,7 +445,7 @@ fn curl_spawn(url: &str) -> Result<tokio::process::Child> {
 
 #[tokio::test]
 async fn test_pull_through_cancels_on_disconnect() -> Result<()> {
-    let fix = setup_slow(true).await?;
+    let fix = setup_slow(true, None).await?;
     let narinfo_url = format!("{}/{}.narinfo", fix.main_url, fix.hash);
 
     // The miss starts a pull that drips for ~20s.
@@ -466,7 +486,7 @@ async fn test_pull_through_cancels_on_disconnect() -> Result<()> {
 
 #[tokio::test]
 async fn test_pull_through_completes_without_readers_by_default() -> Result<()> {
-    let fix = setup_slow(false).await?;
+    let fix = setup_slow(false, None).await?;
     let narinfo_url = format!("{}/{}.narinfo", fix.main_url, fix.hash);
 
     let body = curl(&narinfo_url).await?;
@@ -487,6 +507,35 @@ async fn test_pull_through_completes_without_readers_by_default() -> Result<()> 
     assert!(
         body.contains("StorePath: "),
         "background pull should have imported the path, got: {body}"
+    );
+    Ok(())
+}
+
+/// Upstream file names need not match harmonia's `/nar/<hash>.nar` routes
+/// (cache.nixos.org serves `nar/<file>.nar.zst`). The pull must still
+/// stream such files and import them; only the served URL differs.
+#[tokio::test]
+async fn test_pull_through_serves_unroutable_upstream_filename() -> Result<()> {
+    let fix = setup_slow(false, Some("nar/blob.bin")).await?;
+    let narinfo_url = format!("{}/{}.narinfo", fix.main_url, fix.hash);
+
+    let body = curl(&narinfo_url).await?;
+    assert!(
+        body.contains("URL: nar/blob.bin"),
+        "narinfo should name the upstream file verbatim, got: {body}"
+    );
+
+    // This exact request 404'd before the /nar/{tail} catch-all existed.
+    let got = curl_bytes(&format!("{}/nar/blob.bin", fix.main_url)).await?;
+    assert_eq!(got, fix.nar_bytes);
+
+    // And the pull still imports normally.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    fix.slow_task.abort();
+    let body = curl(&narinfo_url).await?;
+    assert!(
+        body.contains("StorePath: "),
+        "path should be served locally after import, got: {body}"
     );
     Ok(())
 }

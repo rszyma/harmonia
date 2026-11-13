@@ -210,6 +210,45 @@ pub(crate) async fn get(
         .body(actix_web::body::SizedStream::new(rlength, stream)))
 }
 
+/// Serve an in-flight pull-through download by the upstream file name.
+/// Upstream narinfos are served verbatim, so their `URL:` may name files
+/// outside harmonia's own `/nar/<hash>.nar` routes (e.g. c.n.o's
+/// `nar/<file>.nar.zst`). This catch-all (registered after the specific
+/// routes, so it only sees paths they reject) streams the growing file
+/// for a path no other route matched, as long as its pull is still
+/// running. Anything else stays 404 and the client falls back to its next
+/// substituter — including the narrow race where the pull finished between
+/// the client's narinfo and NAR requests.
+///
+/// Streaming the temp file (rather than the store) is required for
+/// correctness here, not just convenience: the client verifies the bytes
+/// against the verbatim narinfo (`FileHash`/`NarHash`), and only the
+/// downloaded bytes match those. Absolute upstream URLs never reach this
+/// handler — the client fetches those straight from the upstream.
+pub(crate) async fn get_inflight(
+    tail: web::Path<String>,
+    settings: web::Data<Config>,
+) -> crate::ServerResult {
+    let candidate = format!("/nar/{}", tail.into_inner());
+    let dl = match PullThrough::find_by_nar_path(&settings.pull_through, &candidate) {
+        Some(dl) => dl,
+        None => {
+            return Ok(HttpResponse::NotFound()
+                .insert_header(crate::cache_control_no_store())
+                .body("store path not found"));
+        }
+    };
+    let stream = PullThrough::stream_nar(dl)
+        .await
+        .io_context("failed opening the in-progress download")?;
+    Ok(HttpResponse::Ok()
+        .insert_header((
+            http::header::CONTENT_TYPE,
+            crate::zstd_body::NAR_CONTENT_TYPE,
+        ))
+        .streaming(stream))
+}
+
 /// Create a stream that skips `offset` bytes and returns at most `length` bytes.
 fn create_range_stream<S>(
     stream: S,
