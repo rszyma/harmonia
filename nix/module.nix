@@ -147,6 +147,9 @@ in
       services.harmonia-dev.cache.settings.upstream_caches = cacheCfg.pullThrough.upstreamCaches;
       services.harmonia-dev.cache.settings.upstream_cancel_on_disconnect =
         cacheCfg.pullThrough.cancelOnDisconnect;
+      # `nix copy` (libgc) reads /proc/stat at startup and warns when the
+      # stock `ProcSubset = "pid"` hides it. Process hiding stays.
+      systemd.services.harmonia-dev.serviceConfig.ProcSubset = lib.mkForce "all";
     })
     (lib.mkIf cacheCfg.enable {
       warnings =

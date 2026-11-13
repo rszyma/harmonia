@@ -748,10 +748,11 @@ async fn import_staged(
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     if !status.success() {
+        // Log all of stderr, not just the first line: under the service
+        // sandbox the first line is often a `nix`-runtime warning (e.g.
+        // libgc unable to read /proc) while the real error follows it.
         let stderr: String = String::from_utf8_lossy(&stderr_task.await.unwrap_or_default())
-            .lines()
-            .next()
-            .unwrap_or("")
+            .trim()
             .to_string();
         tracing::warn!("pull-through: `nix copy {path_str}` failed: {stderr}");
         return false;
