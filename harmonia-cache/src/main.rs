@@ -21,6 +21,7 @@ mod nar;
 mod narinfo;
 mod narlist;
 mod prometheus;
+mod pull_through;
 mod realisations;
 mod root;
 mod serve;

@@ -61,6 +61,17 @@ in
           description = "Paths to the signing keys to use for signing the cache";
         };
 
+        pullThrough = {
+          enable = lib.mkEnableOption "pull-through fetching: import store paths missing locally from upstream binary caches into /nix/store";
+
+          upstreamCaches = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            example = [ "https://cache.nixos.org" ];
+            description = "Upstream binary caches to pull missing store paths from. The first upstream that has a requested path is imported with `nix copy`, so the cache host accumulates everything it serves. Importing trusts the upstream signatures through the host's `trusted-public-keys`.";
+          };
+        };
+
         settings = lib.mkOption {
           type = lib.types.submodule { freeformType = format.type; };
 
@@ -125,6 +136,9 @@ in
   };
 
   config = lib.mkMerge [
+    (lib.mkIf (cacheCfg.enable && cacheCfg.pullThrough.enable) {
+      services.harmonia-dev.cache.settings.upstream_caches = cacheCfg.pullThrough.upstreamCaches;
+    })
     (lib.mkIf cacheCfg.enable {
       warnings =
         if cacheCfg.signKeyPath != null then
@@ -158,6 +172,10 @@ in
 
         requires = [ "harmonia-dev.socket" ];
         after = [ "harmonia-dev.socket" ];
+
+        # Pull-through shells out to `nix copy` and fetches from upstream
+        # binary caches over the network.
+        path = lib.mkIf cacheCfg.pullThrough.enable [ config.nix.package ];
 
         environment = {
           CONFIG_FILE = lib.mkIf (configFile != null) configFile;
@@ -205,9 +223,18 @@ in
           SystemCallArchitectures = "native";
 
           # accept(2) on the inherited fd is exempt from both restrictions.
-          PrivateNetwork = true;
-          RestrictAddressFamilies = [ "AF_UNIX" ];
-          IPAddressDeny = "any";
+          # Pull-through needs outbound network access to upstream caches.
+          PrivateNetwork = !cacheCfg.pullThrough.enable;
+          RestrictAddressFamilies =
+            if cacheCfg.pullThrough.enable then
+              [
+                "AF_UNIX"
+                "AF_INET"
+                "AF_INET6"
+              ]
+            else
+              [ "AF_UNIX" ];
+          IPAddressDeny = if cacheCfg.pullThrough.enable then "none" else "any";
 
           PrivateTmp = true;
           PrivateDevices = true;

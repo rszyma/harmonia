@@ -166,6 +166,29 @@ sign_key_paths = [ "/run/secrets/cache.secret" ]
 Harmonia also reads the `SIGN_KEY_PATHS` environment variable which holds paths to secret keys separated by spaces.
 All paths provided by `sign_key_paths` config option and `SIGN_KEY_PATHS` environment variable will be used for signing.
 
+### Pull-through from upstream caches
+
+When `upstream_caches` is set, a request for a store path that is not in the
+local store starts a single download of the upstream NAR into a temp file.
+Concurrent requests for the same path stream the growing file immediately
+instead of waiting for the download; a slow client only slows its own
+stream. When the download completes, the path is imported into the local
+store with `nix copy`, so the cache host accumulates everything it serves
+and later requests are served from `/nix/store` normally. Requests that no
+upstream has stay 404, so clients fall back to their next substituter.
+
+```toml
+upstream_caches = [ "https://cache.nixos.org" ]
+```
+
+Imported paths keep their upstream signatures (nothing new is signed unless
+you also configure `sign_key_paths`), so importing trusts the upstream
+signatures through the host's Nix configuration (`trusted-public-keys`),
+exactly like a manual `nix copy --from <upstream>`. The `nix` binary must be
+on `PATH`, and the service user needs permission to import into the store.
+On NixOS, use `services.harmonia-dev.cache.pullThrough` (see below), which
+relaxes the service sandbox accordingly.
+
 ### TLS Configuration
 
 Harmonia can serve content over HTTPS without requiring a reverse proxy. To enable TLS, specify the paths to your certificate and private key files in the configuration:

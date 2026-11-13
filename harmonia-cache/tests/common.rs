@@ -85,6 +85,16 @@ pub fn pick_unused_port() -> Option<u16> {
 
 /// Helper to start harmonia-cache server
 pub async fn start_harmonia_cache(config: &str, port: u16) -> Result<Box<dyn Send>> {
+    start_harmonia_cache_with_env(config, port, &[]).await
+}
+
+/// Helper to start harmonia-cache server with extra environment variables
+/// (e.g. `NIX_CONFIG` to trust test keys in pull-through imports).
+pub async fn start_harmonia_cache_with_env(
+    config: &str,
+    port: u16,
+    extra_env: &[(&str, &str)],
+) -> Result<Box<dyn Send>> {
     let config_file = write_toml_config(config)?;
     let config_path = config_file.path().to_path_buf();
 
@@ -92,10 +102,14 @@ pub async fn start_harmonia_cache(config: &str, port: u16) -> Result<Box<dyn Sen
     // Use HARMONIA_CACHE_BIN env var if set (for coverage), otherwise cargo's built-in path
     let bin_path = std::env::var("HARMONIA_CACHE_BIN")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_harmonia-cache").to_string());
-    let cache_process = Command::new(&bin_path)
+    let mut command = Command::new(&bin_path);
+    command
         .env("CONFIG_FILE", &config_path)
-        .env("RUST_LOG", "debug")
-        .spawn()?;
+        .env("RUST_LOG", "debug");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let cache_process = command.spawn()?;
 
     let pid = cache_process.id();
     println!("Started harmonia-cache process with PID: {pid}");

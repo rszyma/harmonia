@@ -1,10 +1,12 @@
 use crate::error::{CacheError, ConfigError, Result};
+use crate::pull_through::PullThrough;
 use crate::store::Store;
 use harmonia_store_path::StoreDir;
 use harmonia_utils_signature::SecretKey;
 use serde::Deserialize;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
+use url::Url;
 
 fn default_bind() -> String {
     "[::]:5000".into()
@@ -120,6 +122,19 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) zstd: ZstdConfig,
 
+    /// Upstream binary caches to pull missing store paths from. The first
+    /// upstream that has a requested path is downloaded once into a temp
+    /// file, streamed progressively to waiting clients, and then imported
+    /// into the local store with `nix copy`, so the cache host accumulates
+    /// everything it serves. Empty (the default) disables pull-through:
+    /// misses stay 404.
+    ///
+    /// Note: importing trusts the upstream signatures through the host's
+    /// Nix configuration (`trusted-public-keys`), exactly like a normal
+    /// `nix copy --from <upstream>`.
+    #[serde(default)]
+    pub(crate) upstream_caches: Vec<Url>,
+
     #[serde(default)]
     pub(crate) sign_key_path: Option<String>,
     #[serde(default)]
@@ -137,6 +152,8 @@ pub(crate) struct Config {
     pub(crate) secret_keys: Vec<SecretKey>,
     #[serde(skip)]
     pub(crate) store: Store,
+    #[serde(skip)]
+    pub(crate) pull_through: PullThrough,
 }
 
 impl Default for Config {
@@ -248,6 +265,8 @@ pub(crate) fn load() -> Result<Config> {
         .into());
     }
     settings.store = Store::new(store_dir, settings.real_nix_store.clone(), db_path);
+    settings.pull_through = PullThrough::new(settings.upstream_caches.clone())
+        .map_err(|e| ConfigError::Invalid { reason: e })?;
     Ok(settings)
 }
 

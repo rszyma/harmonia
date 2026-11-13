@@ -34,7 +34,7 @@ tokio-util = { workspace = true, features = [ "io" ] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-url = "2.5.7"
+url = { version = "2.5.7", features = ["serde"] }
 zstd = "0.14"
 # Nix.rs-based crates
 bytes                        = { workspace = true }
@@ -52,6 +52,15 @@ harmonia-utils-hash          = { workspace = true }
 harmonia-utils-signature     = { workspace = true }
 nix                          = { workspace = true, features = [ "socket", "fs" ] }
 prometheus                   = { workspace = true }
+tempfile = { workspace = true }
+# HTTP client for upstream fetches. hyper-util's legacy client is
+# multithreaded and pooled, and needs only the hyper stack: no tower,
+# no QUIC, no second client framework.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "aws-lc-rs", "webpki-tokio"] }
+http = "1"
+http-body-util = { version = "0.1", default-features = false, features = ["full"] }
 
 [dev-dependencies]
 harmonia-utils-io   = { workspace = true }

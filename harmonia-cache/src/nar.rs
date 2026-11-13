@@ -1,5 +1,6 @@
 use crate::config::Config;
-use crate::error::{CacheError, StoreError};
+use crate::error::{CacheError, IoErrorContext, StoreError};
+use crate::pull_through::{Download, PullThrough};
 use crate::{cache_control_max_age_1y, some_or_404};
 use actix_web::web::Bytes;
 use actix_web::{HttpRequest, HttpResponse, http, web};
@@ -93,11 +94,47 @@ pub(crate) async fn get(
         .query_path_info_by_hash_part(&store_path_hash)?
     {
         Some(info) => info,
-        None => {
-            return Ok(HttpResponse::NotFound()
-                .insert_header(crate::cache_control_no_store())
-                .body("store path not found"));
-        }
+        None => match PullThrough::get_or_start(&settings, outhash).await {
+            Download::Absent => {
+                return Ok(HttpResponse::NotFound()
+                    .insert_header(crate::cache_control_no_store())
+                    .body("store path not found"));
+            }
+            // The import may have finished concurrently; re-check.
+            Download::Present => match settings
+                .store
+                .query_path_info_by_hash_part(&store_path_hash)?
+            {
+                Some(info) => info,
+                None => {
+                    return Ok(HttpResponse::NotFound()
+                        .insert_header(crate::cache_control_no_store())
+                        .body("store path not found"));
+                }
+            },
+            Download::Streaming(dl) => {
+                match settings
+                    .store
+                    .query_path_info_by_hash_part(&store_path_hash)?
+                {
+                    Some(info) => info,
+                    None => {
+                        // The download is still running: stream the
+                        // growing file. No Content-Length (unknown yet)
+                        // and no ranges on in-progress downloads.
+                        let stream = PullThrough::stream_nar(dl)
+                            .await
+                            .io_context("failed opening the in-progress download")?;
+                        return Ok(HttpResponse::Ok()
+                            .insert_header((
+                                http::header::CONTENT_TYPE,
+                                crate::zstd_body::NAR_CONTENT_TYPE,
+                            ))
+                            .streaming(stream));
+                    }
+                }
+            }
+        },
     };
     let store_path = &info.path;
 

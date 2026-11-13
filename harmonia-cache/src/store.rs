@@ -43,6 +43,11 @@ impl Store {
         &self.store_dir
     }
 
+    /// Path to the nix SQLite database backing this store.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
     /// Run `f` against this thread's SQLite handle to the nix database.
     fn with_db<R>(&self, f: impl FnOnce(&StoreDb) -> Result<R>) -> Result<R> {
         LOCAL_DB.with(|cell| {
