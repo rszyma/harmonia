@@ -233,6 +233,9 @@ pub(crate) async fn get_inflight(
     let dl = match PullThrough::find_by_nar_path(&settings.pull_through, &candidate) {
         Some(dl) => dl,
         None => {
+            // Either never pulled (unknown file) or its pull already
+            // ended (finished, failed, or cancelled after disconnect).
+            tracing::debug!("pull-through: no in-flight pull names {candidate}");
             return Ok(HttpResponse::NotFound()
                 .insert_header(crate::cache_control_no_store())
                 .body("store path not found"));

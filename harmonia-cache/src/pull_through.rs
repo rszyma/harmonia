@@ -70,6 +70,11 @@ pub(crate) struct ActiveDownload {
     /// NAR streams currently attached. Only streaming readers count:
     /// narinfo responses complete immediately and hold nothing.
     readers: AtomicUsize,
+    /// Whether a reader ever attached. Together with `readers` this tells
+    /// the download task whether any downstream was (or still is)
+    /// interested; cancellation requires a disconnect, so a pull nobody
+    /// ever streamed is never abandoned.
+    had_readers: AtomicBool,
     /// Last time a reader attached or detached (creation time if never).
     /// Together with `readers` this tells the download task whether any
     /// downstream is still interested.
@@ -92,6 +97,7 @@ impl ActiveDownload {
             done: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             readers: AtomicUsize::new(0),
+            had_readers: AtomicBool::new(false),
             last_reader_seen: Mutex::new(Instant::now()),
         })
     }
@@ -128,14 +134,18 @@ impl ActiveDownload {
         self.failed.load(Ordering::Acquire)
     }
 
-    /// Whether the download must be abandoned: the cancel policy is on and
-    /// no reader has been attached for longer than `linger`. The linger
-    /// covers the normal gap between a client's narinfo request (which
-    /// holds no reader) and its follow-up NAR request, so only genuinely
-    /// uninterested downloads — disconnected readers, narinfo-only clients
-    /// that never come back for the NAR — are cancelled.
+    /// Whether the download must be abandoned: the cancel policy is on,
+    /// a reader attached at least once and then every reader detached,
+    /// and the last detach is older than `linger`. Cancellation requires
+    /// a disconnect, not merely an idle download: nix pipelines narinfo
+    /// queries far ahead of NAR fetches, so a queued path's NAR routinely
+    /// starts long after its narinfo was served. A pull nobody ever
+    /// streamed always runs to completion. The linger only debounces
+    /// genuine disconnects, so a flapping reader does not kill a pull
+    /// another client is about to rejoin.
     fn should_cancel(&self, enabled: bool, linger: Duration) -> bool {
         enabled
+            && self.had_readers.load(Ordering::Acquire)
             && self.readers.load(Ordering::Acquire) == 0
             && self
                 .last_reader_seen
@@ -155,6 +165,7 @@ struct ReaderGuard {
 impl ReaderGuard {
     fn new(dl: &Arc<ActiveDownload>) -> Self {
         dl.readers.fetch_add(1, Ordering::Release);
+        dl.had_readers.store(true, Ordering::Release);
         Self { dl: dl.clone() }
     }
 }
@@ -951,20 +962,26 @@ mod tests {
     }
 
     #[test]
-    fn cancels_only_without_recent_readers() {
+    fn cancels_only_after_a_disconnect() {
         use std::time::Duration;
-        let dl = ActiveDownload::new("StorePath: /nix/store/abc-widget\n".to_string())
-            .expect("temp dir");
+        let dl = Arc::new(
+            ActiveDownload::new("StorePath: /nix/store/abc-widget\n".to_string())
+                .expect("temp dir"),
+        );
         // Policy off: never cancels, however idle.
         assert!(!dl.should_cancel(false, Duration::ZERO));
-        // Policy on but freshly created (linger not yet elapsed): no cancel.
-        assert!(!dl.should_cancel(true, Duration::from_secs(3600)));
-        // Linger elapsed and no reader ever attached: cancel.
-        assert!(dl.should_cancel(true, Duration::ZERO));
+        // Never streamed, however idle: no disconnect happened, no cancel.
+        // (nix pipelines narinfos far ahead of NAR fetches; a queued NAR
+        // routinely starts minutes after its narinfo was served.)
+        assert!(!dl.should_cancel(true, Duration::ZERO));
         // An attached reader suppresses cancellation however idle.
-        let dl = Arc::new(dl);
         let _reader = ReaderGuard::new(&dl);
         assert!(!dl.should_cancel(true, Duration::ZERO));
+        // Detached beyond the linger: cancel.
+        drop(_reader);
+        assert!(dl.should_cancel(true, Duration::ZERO));
+        // ...but not before the linger elapses.
+        assert!(!dl.should_cancel(true, Duration::from_secs(3600)));
     }
 
     #[test]

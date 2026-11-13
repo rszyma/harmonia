@@ -540,6 +540,39 @@ async fn test_pull_through_serves_unroutable_upstream_filename() -> Result<()> {
     Ok(())
 }
 
+/// Queued NARs start long after their narinfo was served: with the
+/// cancel policy on and no reader ever attached, the pull must still
+/// run to completion instead of aborting (cancellation requires a
+/// disconnect). hits stays 1: no refetch happens.
+#[tokio::test]
+async fn test_pull_through_never_attached_pull_completes() -> Result<()> {
+    let fix = setup_slow(true, None).await?;
+    let narinfo_url = format!("{}/{}.narinfo", fix.main_url, fix.hash);
+
+    let body = curl(&narinfo_url).await?;
+    let nar_path = nar_url_path_from(&body)?;
+    // Past the linger with no reader ever attached: the pull survives.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let body = curl(&narinfo_url).await?;
+    assert!(body.contains("StorePath: "));
+    assert_eq!(
+        fix.hits.load(Ordering::Relaxed),
+        1,
+        "a pull nobody streamed must not be abandoned"
+    );
+    // The late NAR starts streaming the still-running pull to completion.
+    let got = curl_bytes(&format!("{}/{nar_path}", fix.main_url)).await?;
+    assert_eq!(got, fix.nar_bytes);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    fix.slow_task.abort();
+    let body = curl(&narinfo_url).await?;
+    assert!(
+        body.contains("StorePath: "),
+        "path should be served locally after import, got: {body}"
+    );
+    Ok(())
+}
+
 async fn curl_status(url: &str) -> Result<u16> {
     let output = tokio::process::Command::new("curl")
         .args([

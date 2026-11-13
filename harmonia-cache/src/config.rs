@@ -135,13 +135,16 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) upstream_caches: Vec<Url>,
 
-    /// Global for all upstream caches: abandon an in-progress pull once it
-    /// has no downstream reader left. Cancellation fires only after no
-    /// reader has been attached for 10 seconds, so the normal gap between
-    /// a client's narinfo request and its follow-up NAR request does not
-    /// abort the download. `false` (default) keeps the download running in
-    /// the background to completion, warming the cache. Either way a later
-    /// request simply starts a fresh download.
+    /// Global for all upstream caches: abandon an in-progress pull once
+    /// every attached reader has disconnected. Cancellation requires a
+    /// disconnect — a pull nobody ever streamed always runs to completion,
+    /// since nix pipelines narinfo queries far ahead of NAR fetches and a
+    /// queued path's NAR routinely starts long after its narinfo was
+    /// served. After all readers detach, a 10s linger gives a flapping
+    /// client room to rejoin before the pull is abandoned. `false`
+    /// (default) keeps every download running in the background to
+    /// completion, warming the cache. Either way a later request simply
+    /// starts a fresh download.
     #[serde(default)]
     pub(crate) upstream_cancel_on_disconnect: bool,
 

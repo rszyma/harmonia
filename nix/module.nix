@@ -75,7 +75,7 @@ in
             type = lib.types.bool;
             default = false;
             example = true;
-            description = "Abandon an in-progress pull once it has no downstream reader left, instead of finishing it in the background (global for all upstream caches). Cancellation fires only after 10 seconds without a reader, so the normal gap between a client's narinfo request and its follow-up NAR request does not abort the download. A later request simply starts a fresh download.";
+            description = "Abandon an in-progress pull once every attached reader has disconnected, instead of finishing it in the background (global for all upstream caches). Cancellation requires a disconnect: a pull nobody ever streamed always runs to completion, since nix pipelines narinfo queries far ahead of NAR fetches. After the last reader detaches, a 10 second linger gives a flapping client room to rejoin. A later request simply starts a fresh download.";
           };
         };
 
@@ -243,7 +243,9 @@ in
               ]
             else
               [ "AF_UNIX" ];
-          IPAddressDeny = if cacheCfg.pullThrough.enable then "none" else "any";
+          # Unset (allow) when pull-through needs the network; "none"
+          # is not valid systemd syntax and only logs a warning.
+          IPAddressDeny = lib.mkIf (!cacheCfg.pullThrough.enable) "any";
 
           PrivateTmp = true;
           PrivateDevices = true;

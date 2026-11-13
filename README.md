@@ -192,11 +192,14 @@ relaxes the service sandbox accordingly.
 By default a pull runs to completion in the background even if the client
 that triggered it disconnects, warming the cache for the next request. Set
 `upstream_cancel_on_disconnect = true` (global for all upstream caches) to
-abandon a pull instead once it has no downstream reader left — a later
-request simply starts a fresh download. Cancellation fires only after 10
-seconds without a reader, so the normal gap between a client's narinfo
-request and its follow-up NAR request does not abort the download (a fully
-stalled upstream still resolves through the download's idle timeout).
+abandon a pull instead once every attached reader has disconnected — a
+later request simply starts a fresh download. Cancellation requires a
+disconnect: a pull nobody ever streamed always runs to completion, since
+nix pipelines narinfo queries far ahead of NAR fetches and a queued path's
+NAR routinely starts long after its narinfo was served. After the last
+reader detaches, a 10 second linger gives a flapping client room to rejoin
+(a fully stalled upstream still resolves through the download's idle
+timeout).
 
 ### TLS Configuration
 
