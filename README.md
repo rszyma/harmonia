@@ -176,8 +176,12 @@ request starts a single download of the upstream NAR into a temp file.
 Concurrent requests for the same path stream the growing file immediately
 instead of waiting for the download; a slow client only slows its own
 stream. When the download completes, the path is imported into the local
-store with `nix copy`, so the cache host accumulates everything it serves
-and later requests are served from `/nix/store` normally. Requests that no
+store with `nix copy --from` the upstream it came from, so the cache host
+accumulates everything it serves and later requests are served from
+`/nix/store` normally. The import re-fetches the NAR from upstream (`nix
+copy` resolves the path's closure in the source store, which a lone temp
+file cannot satisfy): one extra upstream fetch per new path, while
+references already valid locally are skipped. Requests that no
 upstream has stay 404, so clients fall back to their next substituter.
 Narinfo-only clients never trigger a download: pulls start exclusively
 on NAR requests.

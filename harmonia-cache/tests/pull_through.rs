@@ -13,7 +13,7 @@ use common::{
 };
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
@@ -71,26 +71,108 @@ fn add_to_store(store_dir: &Path, state_dir: &Path, content: &[u8]) -> Result<(S
     Ok((path, hash))
 }
 
+/// Dump the NAR serialization of `path` (what the NAR route serves).
+fn dump_path(store_dir: &Path, state_dir: &Path, path: &str) -> Result<Vec<u8>> {
+    let output = Command::new("nix-store")
+        .args(["--dump", path, "--store", &store_url(store_dir, state_dir)])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "nix-store --dump failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(output.stdout)
+}
+
+/// Wait until `path` is valid in the store (i.e. the pull-through import
+/// landed), polling `nix-store --query`. The import re-fetches from
+/// upstream in the background, so killing the source (or asserting local
+/// serving) must wait for it.
+async fn wait_imported(store_dir: &Path, state_dir: &Path, path: &str) -> Result<()> {
+    let url = store_url(store_dir, state_dir);
+    for _ in 0..100 {
+        let status = Command::new("nix")
+            .args(["path-info", "--store", &url, path])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("timed out waiting for import of {path}").into())
+}
+
+/// Re-register `path` with the given references (`nix-store --add` records
+/// none). Stdin format: path, empty deriver line, ref count, one ref per
+/// line; hashes are recomputed from the store content.
+fn register_refs(store_dir: &Path, state_dir: &Path, path: &str, refs: &[String]) -> Result<()> {
+    let mut input = format!("{path}\n\n{}\n", refs.len());
+    for r in refs {
+        input.push_str(r);
+        input.push('\n');
+    }
+    let mut child = Command::new("nix-store")
+        .args([
+            "--register-validity",
+            "--reregister",
+            "--store",
+            &store_url(store_dir, state_dir),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("no stdin")?
+        .write_all(input.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "nix-store --register-validity failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
 struct Fixture {
     _temp_dir: CanonicalTempDir,
     hash: String,
+    store_path: String,
+    store_dir: PathBuf,
+    main_state: PathBuf,
     main_url: String,
     upstream_guard: Option<Box<dyn Send>>,
     _main_guard: Box<dyn Send>,
     _key_file: NamedTempFile,
 }
 
-async fn setup(payload: &[u8]) -> Result<Fixture> {
-    let temp_dir = CanonicalTempDir::new()?;
-    let root = temp_dir.path().to_path_buf();
-    let store_dir = root.join("store");
-    let upstream_state = root.join("var-upstream/nix");
-    let main_state = root.join("var-main/nix");
-    init_local_store(&store_dir, &upstream_state)?;
-    init_local_store(&store_dir, &main_state)?;
+struct ServerPair {
+    main_url: String,
+    upstream_url: String,
+    upstream_guard: Option<Box<dyn Send>>,
+    _main_guard: Box<dyn Send>,
+    _key_file: NamedTempFile,
+}
 
-    let (_upstream_path, hash) = add_to_store(&store_dir, &upstream_state, payload)?;
-
+async fn start_pair(
+    store_dir: &Path,
+    upstream_state: &Path,
+    main_state: &Path,
+) -> Result<ServerPair> {
+    // Isolate the narinfo disk cache per test: `nix copy` children share
+    // it via XDG_CACHE_HOME, and a SIGKILLED copy can leave a stale SQLite
+    // lock that blocks every later run.
+    let xdg_cache = store_dir.parent().ok_or("no parent dir")?.join("xdg-cache");
+    std::fs::create_dir_all(&xdg_cache)?;
+    let xdg_cache = xdg_cache.to_string_lossy().to_string();
     let key_file = write_temp_file(SIGNING_KEY.trim())?;
     let upstream_port = pick_unused_port().ok_or("No available ports")?;
     let upstream_config = format!(
@@ -103,7 +185,12 @@ async fn setup(payload: &[u8]) -> Result<Fixture> {
         key = key_file.path().display(),
         store = store_dir.display(),
     );
-    let upstream_guard = start_harmonia_cache(&upstream_config, upstream_port).await?;
+    let upstream_guard = start_harmonia_cache_with_env(
+        &upstream_config,
+        upstream_port,
+        &[("XDG_CACHE_HOME", xdg_cache.as_str())],
+    )
+    .await?;
     let upstream_url = format!("http://127.0.0.1:{upstream_port}");
 
     let main_port = pick_unused_port().ok_or("No available ports")?;
@@ -119,20 +206,47 @@ async fn setup(payload: &[u8]) -> Result<Fixture> {
     let main_guard = start_harmonia_cache_with_env(
         &main_config,
         main_port,
-        &[(
-            "NIX_CONFIG",
-            &format!("trusted-public-keys = {}", PUBLIC_KEY.trim()),
-        )],
+        &[
+            (
+                "NIX_CONFIG",
+                &format!("trusted-public-keys = {}", PUBLIC_KEY.trim()),
+            ),
+            ("XDG_CACHE_HOME", xdg_cache.as_str()),
+        ],
     )
     .await?;
+
+    Ok(ServerPair {
+        main_url: format!("http://127.0.0.1:{main_port}"),
+        upstream_url,
+        upstream_guard: Some(upstream_guard),
+        _main_guard: main_guard,
+        _key_file: key_file,
+    })
+}
+
+async fn setup(payload: &[u8]) -> Result<Fixture> {
+    let temp_dir = CanonicalTempDir::new()?;
+    let root = temp_dir.path().to_path_buf();
+    let store_dir = root.join("store");
+    let upstream_state = root.join("var-upstream/nix");
+    let main_state = root.join("var-main/nix");
+    init_local_store(&store_dir, &upstream_state)?;
+    init_local_store(&store_dir, &main_state)?;
+
+    let (store_path, hash) = add_to_store(&store_dir, &upstream_state, payload)?;
+    let pair = start_pair(&store_dir, &upstream_state, &main_state).await?;
 
     Ok(Fixture {
         _temp_dir: temp_dir,
         hash,
-        main_url: format!("http://127.0.0.1:{main_port}"),
-        upstream_guard: Some(upstream_guard),
-        _main_guard: main_guard,
-        _key_file: key_file,
+        store_path,
+        store_dir,
+        main_state,
+        main_url: pair.main_url,
+        upstream_guard: pair.upstream_guard,
+        _main_guard: pair._main_guard,
+        _key_file: pair._key_file,
     })
 }
 
@@ -163,6 +277,9 @@ async fn test_pull_through_imports_into_local_store() -> Result<()> {
     assert_eq!(status, 200, "NAR should be served after import");
 
     // The upstream can go away: the path now lives in the local store.
+    // The import re-fetches from upstream, so wait for it to land before
+    // killing the source.
+    wait_imported(&fixture.store_dir, &fixture.main_state, &fixture.store_path).await?;
     fixture.upstream_guard.take();
     let body = curl(&narinfo_url).await?;
     assert!(
@@ -177,6 +294,62 @@ async fn test_pull_through_imports_into_local_store() -> Result<()> {
     ))
     .await?;
     assert_eq!(status, 404, "unknown path should stay a 404");
+    Ok(())
+}
+
+/// The pulled path has a reference: `nix copy` resolves the closure in
+/// the *source* store, so importing from a lone staged NAR could never
+/// work. The import must come from the upstream, which holds the closure.
+#[tokio::test]
+async fn test_pull_through_imports_path_with_references() -> Result<()> {
+    let temp_dir = CanonicalTempDir::new()?;
+    let root = temp_dir.path().to_path_buf();
+    let store_dir = root.join("store");
+    let upstream_state = root.join("var-upstream/nix");
+    let main_state = root.join("var-main/nix");
+    init_local_store(&store_dir, &upstream_state)?;
+    init_local_store(&store_dir, &main_state)?;
+
+    let (dep_path, dep_hash) = add_to_store(&store_dir, &upstream_state, b"dependency")?;
+    let dep_base = dep_path
+        .rsplit('/')
+        .next()
+        .ok_or("no file name")?
+        .to_string();
+    // `nix-store --add` records no references, so register one explicitly:
+    // B references A, like any real path references its closure.
+    let payload = b"referrer";
+    let (path_b, hash) = add_to_store(&store_dir, &upstream_state, payload)?;
+    register_refs(&store_dir, &upstream_state, &path_b, &[dep_path])?;
+    let mut pair = start_pair(&store_dir, &upstream_state, &main_state).await?;
+
+    // Sanity: the fixture really has a reference, else this test is vacuous.
+    let upstream_body = curl(&format!("{}/{hash}.narinfo", pair.upstream_url)).await?;
+    assert!(
+        upstream_body.contains(&dep_base),
+        "pulled path should reference the dependency, got: {upstream_body}"
+    );
+
+    let body = curl(&format!("{}/{hash}.narinfo", pair.main_url)).await?;
+    let nar_path = nar_url_path_from(&body)?;
+    let got = curl_bytes(&format!("{}/{nar_path}", pair.main_url)).await?;
+    let expected = dump_path(&store_dir, &upstream_state, &path_b)?;
+    assert_eq!(got, expected, "streamed NAR should match the upstream NAR");
+
+    // Both the path and its reference survive the upstream going away:
+    // the import copied the closure, not just the lone NAR.
+    // The import re-fetches from upstream, so wait for it to land before
+    // killing the source: otherwise take() wins the race and the
+    // post-take requests 404.
+    wait_imported(&store_dir, &main_state, &path_b).await?;
+    pair.upstream_guard.take();
+    for h in [&hash, &dep_hash] {
+        let body = curl(&format!("{}/{h}.narinfo", pair.main_url)).await?;
+        assert!(
+            body.contains("StorePath: "),
+            "path {h} should be served locally, got: {body}"
+        );
+    }
     Ok(())
 }
 

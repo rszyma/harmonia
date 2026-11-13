@@ -55,12 +55,15 @@ pub(crate) enum Download {
     Absent,
 }
 
-/// One in-flight upstream download. The temp dir (NAR file plus import
-/// staging) is deleted when the last reference — readers included — drops.
+/// One in-flight upstream download. The temp dir (NAR file) is deleted when
+/// the last reference — readers included — drops.
 /// Carries no narinfo: pulls are spawned by NAR requests, which already
 /// know their store hash, and the task re-fetches the narinfo itself.
 #[derive(Debug)]
 pub(crate) struct ActiveDownload {
+    /// Owns the temp dir; never read directly, dropping it deletes the
+    /// download (readers hold an `Arc`, so the dir outlives them all).
+    #[allow(dead_code)]
     dir: tempfile::TempDir,
     nar_path: PathBuf,
     /// Bumped on every progress event. Unlike `Notify`, a watch version
@@ -568,7 +571,7 @@ async fn run_download(settings: web::Data<Config>, hash: String, dl: Arc<ActiveD
                     return;
                 }
                 dl.mark_done();
-                if import_staged(&settings.store, pull, &dl, &hash, &path, &narinfo_text).await {
+                if import_from_upstream(&settings.store, pull, &dl, &hash, &path, upstream).await {
                     tracing::info!("pull-through: imported {path}");
                 }
                 return;
@@ -639,52 +642,30 @@ async fn download_to_file(
     Ok(())
 }
 
-/// Import the downloaded NAR into the local store with `nix copy --from
-/// file://`, which re-verifies hashes and records the upstream signatures.
-/// Staging layout mirrors a binary cache; the NAR is hardlinked, not copied.
-async fn import_staged(
+/// Import the pulled path into the local store with `nix copy --from` the
+/// upstream it came from, which re-verifies hashes and records the upstream
+/// signatures. Staging the download in a `file://` cache cannot work: `nix
+/// copy` copies closures and checks the references in the *source* store,
+/// which a single staged NAR never satisfies. The price is one extra
+/// upstream NAR fetch per new path (references already valid locally are
+/// skipped); the client keeps streaming the finished temp file meanwhile,
+/// so the import never blocks serving.
+async fn import_from_upstream(
     store: &Store,
     pull: &PullThrough,
     dl: &ActiveDownload,
     hash: &str,
     path: &StorePath,
-    narinfo_text: &str,
+    upstream: &Url,
 ) -> bool {
-    let cache_dir = dl.dir.path().join("cache");
-    let nar_dir = cache_dir.join("nar");
-    if std::fs::create_dir_all(&nar_dir).is_err()
-        || std::fs::hard_link(&dl.nar_path, nar_dir.join("data.nar")).is_err()
-    {
-        tracing::warn!("pull-through: failed staging the download");
-        return false;
-    }
-    let staged = match staged_narinfo(narinfo_text, store, path) {
-        Some(staged) => staged,
-        None => return false,
-    };
-    if std::fs::write(cache_dir.join(format!("{hash}.narinfo")), staged).is_err()
-        || std::fs::write(
-            cache_dir.join("nix-cache-info"),
-            format!(
-                "StoreDir: {}\nWantMassQuery: 1\nPriority: 30\n",
-                store.store_dir().to_str()
-            ),
-        )
-        .is_err()
-    {
-        tracing::warn!("pull-through: failed writing the staging cache");
-        return false;
-    }
-    let mut from = match Url::parse(&format!("file://{}", cache_dir.display())) {
-        Ok(from) => from,
-        Err(e) => {
-            tracing::warn!("pull-through: invalid staging URL: {e}");
-            return false;
-        }
-    };
+    let path_str = format!("{}/{}", store.store_dir().to_str(), path);
+    // Tell the source which store dir to expect: `nix copy` refuses caches
+    // whose StoreDir differs from the client's (which is `/nix/store`
+    // unless overridden). A no-op in production, required for chroot and
+    // test stores.
+    let mut from = upstream.clone();
     from.query_pairs_mut()
         .append_pair("store", store.store_dir().to_str());
-    let path_str = format!("{}/{}", store.store_dir().to_str(), path);
     let target = match copy_target(store) {
         Some(target) => target,
         None => {
@@ -754,7 +735,7 @@ async fn import_staged(
         let stderr: String = String::from_utf8_lossy(&stderr_task.await.unwrap_or_default())
             .trim()
             .to_string();
-        tracing::warn!("pull-through: `nix copy {path_str}` failed: {stderr}");
+        tracing::warn!("pull-through: `nix copy {path_str}` failed ({status}): {stderr}");
         return false;
     }
     match store.query_path_from_hash_part(
@@ -832,51 +813,6 @@ fn parse_nar_url(narinfo: &str, upstream: &Url) -> Option<String> {
         upstream.as_str().trim_end_matches('/'),
         url.trim_start_matches('/')
     ))
-}
-
-/// Build the narinfo for the staging cache: same bytes, same signatures, but
-/// pointing at our store dir and our staged NAR file. Missing FileHash (and
-/// friends) default to the Nar values, like Nix does.
-fn staged_narinfo(narinfo: &str, store: &Store, path: &StorePath) -> Option<String> {
-    let mut out = String::new();
-    let mut seen_url = false;
-    let mut seen_filehash = false;
-    let mut seen_filesize = false;
-    let mut nar_hash = None;
-    let mut nar_size = None;
-    for line in narinfo.lines() {
-        if line.starts_with("StorePath: ") {
-            out.push_str(&format!(
-                "StorePath: {}/{path}\n",
-                store.store_dir().to_str()
-            ));
-        } else if line.starts_with("URL: ") {
-            out.push_str("URL: nar/data.nar\n");
-            seen_url = true;
-        } else {
-            if line.starts_with("FileHash: ") {
-                seen_filehash = true;
-            } else if line.starts_with("FileSize: ") {
-                seen_filesize = true;
-            } else if let Some(value) = line.strip_prefix("NarHash: ") {
-                nar_hash = Some(value.to_string());
-            } else if let Some(value) = line.strip_prefix("NarSize: ") {
-                nar_size = Some(value.to_string());
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !seen_url {
-        out.push_str("URL: nar/data.nar\n");
-    }
-    if !seen_filehash {
-        out.push_str(&format!("FileHash: {}\n", nar_hash?));
-    }
-    if !seen_filesize {
-        out.push_str(&format!("FileSize: {}\n", nar_size?));
-    }
-    Some(out)
 }
 
 /// Where `nix copy` writes the import: the default `/nix/store` goes through
