@@ -186,6 +186,10 @@ on NAR requests.
 upstream_caches = [ "https://cache.nixos.org" ]
 ```
 
+Upstreams are tried strictly in listed order, first hit wins — unlike nix
+substituters, there is no `priority` weighting here, so list the preferred
+upstream first.
+
 Imported paths keep their upstream signatures (nothing new is signed unless
 you also configure `sign_key_paths`), so importing trusts the upstream
 signatures through the host's Nix configuration (`trusted-public-keys`),
@@ -194,17 +198,16 @@ on `PATH`, and the service user needs permission to import into the store.
 On NixOS, use `services.harmonia-dev.cache.pullThrough` (see below), which
 relaxes the service sandbox accordingly.
 
-Operational note: every pull fetches the narinfo twice — once to serve
-(and rewrite) it, once inside the pull task — and concurrent narinfo
-requests are not de-duplicated. That is deliberate: nothing is stored
-between the narinfo and NAR requests, so each request re-resolves
-everything from the hash alone and the server holds no per-client state
-to expire, persist, or coordinate (only in-flight NAR pulls are tracked,
-and those clean themselves up on completion). The price is duplicate
-tiny GETs instead of a pending-request index with lifetimes.
-Against CDN-fronted upstreams the edge absorbs them; if you serve
-narinfos straight from S3/R2 object storage, each GET is a billed
-request, so front it with a cache.
+Operational note: nothing is stored between the narinfo and NAR requests
+by design, so each request re-resolves everything from the hash alone
+and the server holds no per-client state to expire, persist, or
+coordinate (only in-flight NAR pulls are tracked, and those clean
+themselves up on completion). To avoid re-fetching the same narinfo
+twice per pull, fetched narinfos are memoized briefly (60s TTL, 10k-entry
+cap); concurrent narinfo requests outside that window each cost one
+upstream GET instead of sharing. Against CDN-fronted upstreams the edge
+absorbs those; if you serve narinfos straight from S3/R2 object storage,
+each GET is a billed request, so front it with a cache.
 
 By default a pull runs to completion in the background even if the client
 that triggered it disconnects, warming the cache for the next request. Set

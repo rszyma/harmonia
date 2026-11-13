@@ -551,9 +551,15 @@ async fn test_pull_through_rewrites_upstream_filename() -> Result<()> {
         "narinfo should point at the canonical route, got: {nar_path}"
     );
 
-    // The canonical NAR request spawns the pull and streams it.
+    // The canonical NAR request spawns the pull and streams it — reusing
+    // the memoized narinfo instead of re-fetching it.
     let got = curl_bytes(&format!("{}/{nar_path}", fix.main_url)).await?;
     assert_eq!(got, fix.nar_bytes);
+    assert_eq!(
+        fix.hits.load(Ordering::Relaxed),
+        1,
+        "serve and pull should share one upstream narinfo fetch"
+    );
 
     // And the pull still imports normally.
     tokio::time::sleep(Duration::from_secs(3)).await;

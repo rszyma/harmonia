@@ -127,7 +127,9 @@ pub(crate) struct Config {
     /// file, streamed progressively to waiting clients, and then imported
     /// into the local store with `nix copy`, so the cache host accumulates
     /// everything it serves. Empty (the default) disables pull-through:
-    /// misses stay 404.
+    /// misses stay 404. Upstreams are tried strictly in listed order;
+    /// unlike nix substituters there is no priority weighting, so put the
+    /// preferred one first.
     ///
     /// Note: importing trusts the upstream signatures through the host's
     /// Nix configuration (`trusted-public-keys`), exactly like a normal

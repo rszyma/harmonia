@@ -185,12 +185,35 @@ type HyperClient = hyper_util::client::legacy::Client<
 /// download runs to completion in the background and warms the cache;
 /// `true` aborts it, so disconnected clients stop costing upstream
 /// traffic. Either way a later request simply starts a fresh download.
+/// Recently fetched upstream narinfos: (fetched_at, upstream, text).
+/// Lets the pull task reuse the narinfo the serving path already fetched
+/// instead of re-fetching per pull, and de-duplicates narinfo herds that
+/// arrive within the TTL. Expires by time, not by pull lifecycle, so
+/// there is nothing to coordinate or clean up — and no correctness
+/// impact when it misses: every user re-fetches. Narinfos are
+/// effectively immutable per hash (same store path, hashes and sizes;
+/// only the rewritten URL and accumulated sigs vary), so a short TTL's
+/// staleness window is harmless.
+#[derive(Debug)]
+struct CachedNarinfo {
+    at: Instant,
+    upstream: Url,
+    text: String,
+}
+
+/// Memo horizon: covers serve-to-pull gaps and herds, not deep queues.
+const NARINFO_TTL: Duration = Duration::from_secs(60);
+/// Memory bound: past this many entries, new fetches simply are not
+/// memoized (degrades to re-fetching, never to wrong serving).
+const NARINFO_CACHE_CAP: usize = 10_000;
+
 #[derive(Debug)]
 pub(crate) struct PullThrough {
     upstreams: Vec<Url>,
     cancel_on_disconnect: bool,
     client: HyperClient,
     downloads: Mutex<HashMap<String, Arc<ActiveDownload>>>,
+    narinfo_cache: Mutex<HashMap<String, CachedNarinfo>>,
 }
 
 impl Default for PullThrough {
@@ -200,6 +223,7 @@ impl Default for PullThrough {
             cancel_on_disconnect: false,
             client: default_client(),
             downloads: Mutex::new(HashMap::new()),
+            narinfo_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -228,6 +252,7 @@ impl PullThrough {
             cancel_on_disconnect,
             client,
             downloads: Mutex::new(HashMap::new()),
+            narinfo_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -282,8 +307,51 @@ impl PullThrough {
         Download::Streaming(dl)
     }
 
+    /// Memoized narinfo lookup for tests: `ttl` is `NARINFO_TTL` in
+    /// production. `upstream` restricts the hit to one source, so
+    /// per-upstream failover never reads another upstream's bytes.
+    fn cached_narinfo(
+        &self,
+        hash: &str,
+        upstream: Option<&Url>,
+        ttl: Duration,
+    ) -> Option<(Url, String)> {
+        let cache = self.narinfo_cache.lock().expect("lock poisoned");
+        let entry = cache.get(hash)?;
+        if entry.at.elapsed() >= ttl {
+            return None;
+        }
+        if let Some(upstream) = upstream
+            && &entry.upstream != upstream
+        {
+            return None;
+        }
+        Some((entry.upstream.clone(), entry.text.clone()))
+    }
+
+    fn store_narinfo(&self, hash: &str, upstream: Url, text: String) {
+        let mut cache = self.narinfo_cache.lock().expect("lock poisoned");
+        cache.retain(|_, entry| entry.at.elapsed() < NARINFO_TTL);
+        if cache.len() >= NARINFO_CACHE_CAP {
+            // Full under pressure: skip memoizing rather than serving
+            // wrong. Degrades to re-fetching, nothing else changes.
+            return;
+        }
+        cache.insert(
+            hash.to_string(),
+            CachedNarinfo {
+                at: Instant::now(),
+                upstream,
+                text,
+            },
+        );
+    }
+
     /// Fetch `<hash>.narinfo` from the first upstream that has it.
     pub(crate) async fn fetch_narinfo(&self, hash: &str) -> Option<(Url, String)> {
+        if let Some(hit) = self.cached_narinfo(hash, None, NARINFO_TTL) {
+            return Some(hit);
+        }
         for upstream in &self.upstreams {
             if let Some(text) = self.fetch_narinfo_from(upstream, hash).await {
                 return Some((upstream.clone(), text));
@@ -335,6 +403,9 @@ impl PullThrough {
     }
 
     async fn fetch_narinfo_from(&self, upstream: &Url, hash: &str) -> Option<String> {
+        if let Some((_, text)) = self.cached_narinfo(hash, Some(upstream), NARINFO_TTL) {
+            return Some(text);
+        }
         let url = format!("{}/{hash}.narinfo", upstream.as_str().trim_end_matches('/'));
         let resp = match self.request(&url).await {
             Ok(resp) => resp,
@@ -349,7 +420,10 @@ impl PullThrough {
         }
         match resp.into_body().collect().await {
             Ok(collected) => match String::from_utf8(collected.to_bytes().to_vec()) {
-                Ok(text) => Some(text),
+                Ok(text) => {
+                    self.store_narinfo(hash, upstream.clone(), text.clone());
+                    Some(text)
+                }
                 Err(e) => {
                     tracing::warn!("pull-through: narinfo from {url} is not UTF-8: {e}");
                     None
@@ -458,12 +532,10 @@ impl Drop for FinishGuard<'_> {
 }
 
 /// Download the NAR (failing over across upstreams), then import it. The
-/// narinfo is (re-)fetched inside the task: NAR requests carry only the
-/// store hash, and nothing is stored between the narinfo and NAR requests
-/// by design, so the mapping is resolved here, keyed by it. That doubles
-/// upstream narinfo GETs per pull (serve + task); against CDN-fronted
-/// upstreams the edge absorbs it, against bare S3/R2 object storage each
-/// GET is a billed request — put a cache in front if that matters.
+/// narinfo is resolved inside the task: NAR requests carry only the store
+/// hash, and nothing is stored between the narinfo and NAR requests by
+/// design. A short-TTL memo usually makes this a cache hit on the fetch
+/// the serving path just did, not a second upstream GET.
 async fn run_download(settings: web::Data<Config>, hash: String, dl: Arc<ActiveDownload>) {
     let _cleanup = FinishGuard {
         downloads: &settings.pull_through.downloads,
@@ -893,6 +965,37 @@ mod tests {
             canonical_narinfo("URL: nar/x.nar\nNarHash: sha256:short\n", "abc"),
             None
         );
+    }
+
+    #[test]
+    fn narinfo_memo_hits_and_expires() {
+        use std::time::Duration;
+        let pull = PullThrough::new(vec![], false).expect("empty upstreams");
+        let upstream = Url::parse("http://127.0.0.1:8501").unwrap();
+        let other = Url::parse("http://127.0.0.1:8502").unwrap();
+        assert!(pull.cached_narinfo("abc", None, Duration::ZERO).is_none());
+        pull.store_narinfo("abc", upstream.clone(), "text".to_string());
+        // Unrestricted hit while fresh.
+        assert_eq!(
+            pull.cached_narinfo("abc", None, Duration::from_secs(3600)),
+            Some((upstream.clone(), "text".to_string()))
+        );
+        // Upstream-restricted hit: same source OK, other source is a miss
+        // (failover must never read another upstream's bytes).
+        assert!(
+            pull.cached_narinfo("abc", Some(&upstream), Duration::from_secs(3600))
+                .is_some()
+        );
+        assert!(
+            pull.cached_narinfo("abc", Some(&other), Duration::from_secs(3600))
+                .is_none()
+        );
+        assert!(
+            pull.cached_narinfo("unknown", None, Duration::from_secs(3600))
+                .is_none()
+        );
+        // Expired entries miss however queried.
+        assert!(pull.cached_narinfo("abc", None, Duration::ZERO).is_none());
     }
 
     #[test]
