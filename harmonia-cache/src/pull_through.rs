@@ -559,6 +559,7 @@ async fn run_download(settings: web::Data<Config>, hash: String, dl: Arc<ActiveD
         let Some(nar_url) = parse_nar_url(&narinfo_text, upstream) else {
             continue;
         };
+        tracing::info!("pull-through: pulling {path} from {upstream}");
         match download_to_file(pull, &nar_url, &dl).await {
             Ok(()) => {
                 if dl.should_cancel(pull.cancel_on_disconnect, READER_LINGER) {
@@ -567,7 +568,9 @@ async fn run_download(settings: web::Data<Config>, hash: String, dl: Arc<ActiveD
                     return;
                 }
                 dl.mark_done();
-                import_staged(&settings.store, pull, &dl, &hash, &path, &narinfo_text).await;
+                if import_staged(&settings.store, pull, &dl, &hash, &path, &narinfo_text).await {
+                    tracing::info!("pull-through: imported {path}");
+                }
                 return;
             }
             Err(e) => {

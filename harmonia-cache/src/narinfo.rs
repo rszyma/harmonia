@@ -53,7 +53,10 @@ pub(crate) async fn get(
                     .body("missed hash"));
             }
             match settings.pull_through.fetch_narinfo(&hash).await {
-                Some((_, text)) => {
+                Some((upstream, text)) => {
+                    tracing::debug!(
+                        "pull-through: serving upstream narinfo for {hash} from {upstream}"
+                    );
                     upstream_narinfo = Some(canonical_narinfo(&text, &hash).unwrap_or(text));
                     None
                 }
