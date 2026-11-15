@@ -85,6 +85,15 @@ pub fn pick_unused_port() -> Option<u16> {
 
 /// Helper to start harmonia-cache server
 pub async fn start_harmonia_cache(config: &str, port: u16) -> Result<Box<dyn Send>> {
+    start_harmonia_cache_with_env(config, port, &[]).await
+}
+
+/// Like [`start_harmonia_cache`], with extra environment variables.
+pub async fn start_harmonia_cache_with_env(
+    config: &str,
+    port: u16,
+    env: &[(&str, &Path)],
+) -> Result<Box<dyn Send>> {
     let config_file = write_toml_config(config)?;
     let config_path = config_file.path().to_path_buf();
 
@@ -95,23 +104,24 @@ pub async fn start_harmonia_cache(config: &str, port: u16) -> Result<Box<dyn Sen
     let cache_process = Command::new(&bin_path)
         .env("CONFIG_FILE", &config_path)
         .env("RUST_LOG", "debug")
+        .envs(env.iter().copied())
         .spawn()?;
 
     let pid = cache_process.id();
     println!("Started harmonia-cache process with PID: {pid}");
 
-    let guard = Box::new(ProcessAndFileGuard {
-        _process: ProcessGuard::new(cache_process),
-        _config_file: config_file,
-    });
+    let mut process = ProcessGuard::new(cache_process);
 
     // Wait for HTTP server to be ready
     // For Unix sockets, we don't need to wait for a TCP port
     if port > 0 {
-        wait_for_service("127.0.0.1", port, pid, Duration::from_secs(30)).await?;
+        wait_for_service("127.0.0.1", port, &mut process, Duration::from_secs(30)).await?;
     }
 
-    Ok(guard)
+    Ok(Box::new(ProcessAndFileGuard {
+        _process: process,
+        _config_file: config_file,
+    }))
 }
 
 // Helper functions
@@ -119,9 +129,10 @@ pub async fn start_harmonia_cache(config: &str, port: u16) -> Result<Box<dyn Sen
 async fn wait_for_service(
     host: &str,
     port: u16,
-    pid: u32,
+    process: &mut ProcessGuard,
     timeout_duration: Duration,
 ) -> Result<()> {
+    let pid = process.id();
     println!("Waiting for service (PID {pid}) to start on {host}:{port}");
     let start = std::time::Instant::now();
 
@@ -130,12 +141,9 @@ async fn wait_for_service(
         loop {
             attempt += 1;
 
-            // First check if the process is still running
-            // Try to send signal 0 to check if process exists
-            use nix::sys::signal::{Signal, kill};
-            use nix::unistd::Pid;
-
-            if kill(Pid::from_raw(pid as i32), Signal::SIGCONT).is_err() {
+            // `try_wait` also notices an exited process that is not reaped
+            // yet, which a signal probe would still see as alive.
+            if process.has_exited() {
                 return Err(
                     format!("Process {pid} died while waiting for service to start").into(),
                 );
@@ -187,6 +195,16 @@ pub struct ProcessGuard {
 impl ProcessGuard {
     pub fn new(child: Child) -> Self {
         Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().map_or(0, Child::id)
+    }
+
+    fn has_exited(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_none_or(|child| !matches!(child.try_wait(), Ok(None)))
     }
 }
 

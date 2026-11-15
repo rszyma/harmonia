@@ -28,20 +28,25 @@ pub(crate) async fn get(
         })
     })?;
 
-    let info = some_or_404!(
-        settings
-            .store
-            .query_path_info_by_hash_part(&store_path_hash)?
-    );
-    let narinfo = build_narinfo(
-        settings.store.store_dir(),
-        StorePathKeyed {
-            path: info.path,
-            info: info.info,
-        },
-        &hash,
-        &settings.secret_keys,
-    );
+    let local = settings
+        .store
+        .query_path_info_by_hash_part(&store_path_hash)?;
+    let (info, sign_keys) = match local {
+        Some(info) => (
+            StorePathKeyed {
+                path: info.path,
+                info: info.info,
+            },
+            settings.secret_keys.as_slice(),
+        ),
+        // Not signed with our keys: the content is unverified until pulled.
+        None if settings.pull_through.enabled() => (
+            some_or_404!(crate::pull_through::narinfo(&settings, &store_path_hash).await),
+            &[][..],
+        ),
+        None => some_or_404!(None),
+    };
+    let narinfo = build_narinfo(settings.store.store_dir(), info, &hash, sign_keys);
 
     if param.json.is_some() {
         // JSON format: return the full nar-info (upstream JSON v3 format).

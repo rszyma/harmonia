@@ -1,10 +1,12 @@
 use crate::error::{CacheError, ConfigError, Result};
+use crate::pull_through::PullThrough;
 use crate::store::Store;
 use harmonia_store_path::StoreDir;
 use harmonia_utils_signature::SecretKey;
 use serde::Deserialize;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
+use url::Url;
 
 fn default_bind() -> String {
     "[::]:5000".into()
@@ -77,6 +79,10 @@ impl Default for ZstdConfig {
     }
 }
 
+fn default_nix_daemon_socket() -> PathBuf {
+    PathBuf::from("/nix/var/nix/daemon-socket/socket")
+}
+
 fn default_virtual_store() -> PathBuf {
     PathBuf::from("/nix/store")
 }
@@ -133,10 +139,30 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) nix_db_path: Option<PathBuf>,
 
+    /// Binary caches to pull store paths from when they are missing locally.
+    /// Tried in the listed order; the first one that has the path wins.
+    /// Pulled paths are imported into the local store through the Nix
+    /// daemon. Empty (the default) disables pull-through.
+    #[serde(default)]
+    pub(crate) upstream_caches: Vec<Url>,
+
+    /// Abandon an upstream download when all clients that stream it
+    /// disconnect (after a 10s grace period). By default the download
+    /// continues and the path is imported anyway.
+    #[serde(default)]
+    pub(crate) upstream_cancel_on_disconnect: bool,
+
+    /// Nix daemon socket that pull-through imports go through. The daemon
+    /// checks the upstream signatures against its `trusted-public-keys`.
+    #[serde(default = "default_nix_daemon_socket")]
+    pub(crate) nix_daemon_socket: PathBuf,
+
     #[serde(skip, default)]
     pub(crate) secret_keys: Vec<SecretKey>,
     #[serde(skip)]
     pub(crate) store: Store,
+    #[serde(skip)]
+    pub(crate) pull_through: PullThrough,
 }
 
 impl Default for Config {
@@ -248,6 +274,12 @@ pub(crate) fn load() -> Result<Config> {
         .into());
     }
     settings.store = Store::new(store_dir, settings.real_nix_store.clone(), db_path);
+    settings.pull_through = PullThrough::new(
+        &settings.upstream_caches,
+        settings.upstream_cancel_on_disconnect,
+        settings.nix_daemon_socket.clone(),
+    )
+    .map_err(|reason| ConfigError::Invalid { reason })?;
     Ok(settings)
 }
 

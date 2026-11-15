@@ -12,10 +12,13 @@ name = "harmonia-cache"
 path = "src/main.rs"
 
 [dependencies]
-actix-files = "0.7"
-actix-web = { version = "4", default-features = false, features = [ "macros", "rustls-0_23" ] }
-askama_escape = "0.16.0"
-async-compression = { version = "0.4.42", features = [ "tokio", "bzip2" ] }
+actix-files       = "0.7"
+actix-web         = { version = "4", default-features = false, features = [ "macros", "rustls-0_23" ] }
+askama_escape     = "0.16.0"
+async-compression = { version = "0.4.42", features = [ "tokio", "bzip2", "xz", "zstd" ] }
+# Upstream client for pull-through. Rides the actix stack the server
+# already uses instead of a second HTTP framework.
+awc = { version = "3", default-features = false, features = [ "rustls-0_23" ] }
 http-range = "0.1"
 mime = "0.3"
 percent-encoding = "2.3.2"
@@ -26,16 +29,19 @@ rustls = { version = "0.23", default-features = false, features = [
     "logging",
 ] }
 rustls-pki-types = { version = "1", features = [ "std" ] }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true, features = [ "io" ] }
-toml = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-url = "2.5.7"
-zstd = "0.14"
+# CA roots for https upstreams of pull-through: the system store.
+rustls-native-certs = "0.8"
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+tempfile            = { workspace = true }
+thiserror           = { workspace = true }
+tokio               = { workspace = true }
+tokio-util          = { workspace = true, features = [ "io" ] }
+toml                = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+url                 = { version = "2.5.7", features = [ "serde" ] }
+zstd                = "0.14"
 # Nix.rs-based crates
 bytes                        = { workspace = true }
 futures-core                 = { workspace = true }
@@ -47,6 +53,7 @@ harmonia-store-derivation    = { workspace = true }
 harmonia-store-nar-info      = { workspace = true }
 harmonia-store-path          = { workspace = true }
 harmonia-store-path-info     = { workspace = true }
+harmonia-store-remote        = { workspace = true }
 harmonia-utils-base-encoding = { workspace = true }
 harmonia-utils-hash          = { workspace = true }
 harmonia-utils-signature     = { workspace = true }
@@ -57,8 +64,11 @@ prometheus                   = { workspace = true }
 harmonia-utils-io   = { workspace = true }
 harmonia-utils-test = { workspace = true }
 nix                 = { workspace = true }
-tempfile            = { workspace = true }
-tokio               = { workspace = true, features = [ "process" ] }
+# HTTPS upstream in the pull-through tests.
+rcgen        = { version = "0.14", default-features = false, features = [ "aws_lc_rs", "pem" ] }
+tempfile     = { workspace = true }
+tokio        = { workspace = true, features = [ "process" ] }
+tokio-rustls = { version = "0.26", default-features = false, features = [ "aws_lc_rs" ] }
 
 [lints]
 workspace = true

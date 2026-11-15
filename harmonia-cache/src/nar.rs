@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::error::{CacheError, StoreError};
+use crate::pull_through::NarMiss;
 use crate::{cache_control_max_age_1y, some_or_404};
 use actix_web::web::Bytes;
 use actix_web::{HttpRequest, HttpResponse, http, web};
@@ -88,16 +89,23 @@ pub(crate) async fn get(
     })?;
 
     // Single SQLite lookup yields both the store path and its nar hash/size.
-    let info = match settings
+    let mut info = settings
         .store
-        .query_path_info_by_hash_part(&store_path_hash)?
-    {
-        Some(info) => info,
-        None => {
-            return Ok(HttpResponse::NotFound()
-                .insert_header(crate::cache_control_no_store())
-                .body("store path not found"));
+        .query_path_info_by_hash_part(&store_path_hash)?;
+    if info.is_none() && settings.pull_through.enabled() {
+        match crate::pull_through::serve_nar(&settings, &store_path_hash, narhash).await {
+            NarMiss::Response(response) => return Ok(response),
+            NarMiss::NowLocal => {
+                info = settings
+                    .store
+                    .query_path_info_by_hash_part(&store_path_hash)?;
+            }
         }
+    }
+    let Some(info) = info else {
+        return Ok(HttpResponse::NotFound()
+            .insert_header(crate::cache_control_no_store())
+            .body("store path not found"));
     };
     let store_path = &info.path;
 
