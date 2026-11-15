@@ -676,7 +676,12 @@ async fn import_from_upstream(
         }
     };
     let mut command = tokio::process::Command::new("nix");
-    command.arg("copy").arg("--from").arg(from.as_str());
+    command
+        .arg("copy")
+        .arg("--extra-experimental-features")
+        .arg("nix-command")
+        .arg("--from")
+        .arg(from.as_str());
     if let CopyTarget::Direct(url) = &target {
         command.arg("--to").arg(url);
     }
