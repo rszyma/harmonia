@@ -15,9 +15,6 @@ pkgs.testers.nixosTest {
         services.harmonia-dev.cache.signKeyPaths = [ "${../../tests/cache.sk}" ];
 
         networking.firewall.allowedTCPPorts = [ 5000 ];
-        system.extraDependencies = [
-          pkgs.hello
-        ];
       };
 
     cache =
@@ -58,19 +55,26 @@ pkgs.testers.nixosTest {
     client.wait_until_succeeds("timeout 1 curl -f http://cache:5000")
     client.succeed("curl -f http://cache:5000/nix-cache-info")
 
-    # Warm the upstream so the pull-through cache starts out missing the path.
-    upstream.succeed("test -e ${pkgs.hello}")
-    cache.fail("test -e ${pkgs.hello}")
+    # Create a path that exists nowhere else: guest-local store, random
+    # content. (`test -e` cannot prove absence — guests see the shared host
+    # store read-only — so the path must be unique to this run.)
+    storepath = upstream.succeed(
+        "echo probe-$(date +%s%N)-$RANDOM > /tmp/probe && nix-store --add /tmp/probe"
+    ).strip()
+    assert storepath.startswith("/nix/store/"), f"not a store path: {storepath}"
+
+    # Sanity: the pull-through cache must not have it yet (--offline: no
+    # substitution, local validity only).
+    cache.fail(f"nix path-info --offline --store daemon {storepath}")
 
     # Fetch through the pull-through cache: streams to the client and
     # imports into the cache's store in the background.
-    client.wait_until_succeeds("nix copy --from http://cache:5000/ ${pkgs.hello}")
-    client.succeed("${pkgs.hello}/bin/hello")
+    client.wait_until_succeeds(f"nix copy --from http://cache:5000/ {storepath}")
 
     # The import must have landed in the cache's store. Before the service
     # had a writable HOME, its `nix copy` died with
     # `creating directory "/.cache/nix": Read-only file system` and this
     # never appeared.
-    cache.wait_until_succeeds("test -e ${pkgs.hello}")
+    cache.wait_until_succeeds(f"nix path-info --offline --store daemon {storepath}")
   '';
 }
