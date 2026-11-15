@@ -61,6 +61,32 @@ in
           description = "Paths to the signing keys to use for signing the cache";
         };
 
+        pullThrough = {
+          enable = lib.mkEnableOption ''
+            pull-through: serve store paths that are missing locally from
+            upstream binary caches, and import them into the local Nix store
+            through the Nix daemon. The daemon checks the upstream signatures
+            against `nix.settings.trusted-public-keys`
+          '';
+
+          upstreamCaches = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            example = [ "https://cache.nixos.org" ];
+            description = "Upstream binary caches, tried in the listed order.";
+          };
+
+          cancelOnDisconnect = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = ''
+              Abandon an upstream download when all clients that stream it
+              have disconnected for 10 seconds. By default the download
+              continues and the path is imported anyway.
+            '';
+          };
+        };
+
         settings = lib.mkOption {
           type = lib.types.submodule { freeformType = format.type; };
 
@@ -125,6 +151,37 @@ in
   };
 
   config = lib.mkMerge [
+    (lib.mkIf (cacheCfg.enable && cacheCfg.pullThrough.enable) {
+      assertions = [
+        {
+          assertion = cacheCfg.pullThrough.upstreamCaches != [ ];
+          message = "services.harmonia-dev.cache.pullThrough.upstreamCaches must not be empty";
+        }
+      ];
+
+      services.harmonia-dev.cache.settings = {
+        upstream_caches = cacheCfg.pullThrough.upstreamCaches;
+        upstream_cancel_on_disconnect = cacheCfg.pullThrough.cancelOnDisconnect;
+      };
+
+      systemd.services.harmonia-dev = {
+        # Downloads are buffered in a temp file. Keep them on disk, not in a
+        # tmpfs /tmp.
+        environment.TMPDIR = "/var/cache/harmonia";
+        serviceConfig = {
+          CacheDirectory = "harmonia";
+          # Outbound connections to the upstream caches.
+          PrivateNetwork = lib.mkForce false;
+          RestrictAddressFamilies = lib.mkForce [
+            "AF_UNIX"
+            "AF_INET"
+            "AF_INET6"
+          ];
+          IPAddressDeny = lib.mkForce [ ];
+        };
+      };
+    })
+
     (lib.mkIf cacheCfg.enable {
       warnings =
         if cacheCfg.signKeyPath != null then
