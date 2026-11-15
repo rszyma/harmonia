@@ -50,6 +50,8 @@ pkgs.testers.nixosTest {
   };
 
   testScript = ''
+    import time
+
     start_all()
 
     client.wait_until_succeeds("timeout 1 curl -f http://cache:5000")
@@ -75,6 +77,15 @@ pkgs.testers.nixosTest {
     # had a writable HOME, its `nix copy` died with
     # `creating directory "/.cache/nix": Read-only file system` and this
     # never appeared.
-    cache.wait_until_succeeds(f"nix path-info --offline --store daemon {storepath}")
+    ok = False
+    for _ in range(60):
+        try:
+            cache.succeed(f"nix path-info --offline --store daemon {storepath}")
+            ok = True
+            break
+        except Exception:
+            time.sleep(1)
+    print(cache.succeed("journalctl -u harmonia-dev --no-pager | tail -40"))
+    assert ok, f"import of {storepath} never landed in the cache store"
   '';
 }
