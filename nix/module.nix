@@ -150,6 +150,14 @@ in
       # `nix copy` (libgc) reads /proc/stat at startup and warns when the
       # stock `ProcSubset = "pid"` hides it. Process hiding stays.
       systemd.services.harmonia-dev.serviceConfig.ProcSubset = lib.mkForce "all";
+      # The import shells out to `nix copy`, which opens its narinfo disk
+      # cache under $HOME. DynamicUser + ProtectSystem/ProtectHome leave
+      # no writable home, so the copy dies with `creating directory
+      # "/.cache/nix": Read-only file system` before fetching anything.
+      # A state dir gives it a persistent, writable home (and a warm
+      # disk cache across restarts).
+      systemd.services.harmonia-dev.serviceConfig.StateDirectory = "harmonia";
+      systemd.services.harmonia-dev.environment.HOME = "/var/lib/harmonia";
     })
     (lib.mkIf cacheCfg.enable {
       warnings =
