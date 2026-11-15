@@ -67,7 +67,7 @@ pkgs.testers.nixosTest {
 
     # Sanity: the pull-through cache must not have it yet (--offline: no
     # substitution, local validity only).
-    cache.fail(f"nix path-info --offline --store daemon {storepath}")
+    cache.fail(f"nix path-info --offline {storepath}")
 
     # Fetch through the pull-through cache: streams to the client and
     # imports into the cache's store in the background.
@@ -80,7 +80,7 @@ pkgs.testers.nixosTest {
     ok = False
     for _ in range(60):
         try:
-            cache.succeed(f"nix path-info --offline --store daemon {storepath}")
+            cache.succeed(f"nix path-info --offline {storepath}")
             ok = True
             break
         except Exception:
